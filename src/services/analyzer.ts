@@ -1,0 +1,1202 @@
+import type {
+  Finding,
+  CategoryResult,
+  AnalysisResult,
+  OpportunityInput,
+  RiskLevel,
+  OpportunityQuality,
+  PublicAnalysisResult,
+} from '../types/analysis.js';
+
+function getDomainFromUrl(url: string): string | null {
+  try {
+    const u = new URL(url.startsWith('http') ? url : `https://${url}`);
+    return u.hostname.toLowerCase().replace(/^www\./, '');
+  } catch {
+    return null;
+  }
+}
+
+function getDomainFromEmail(email: string): string | null {
+  const match = email.trim().toLowerCase().match(/@([\w.-]+)/);
+  return match ? match[1] : null;
+}
+
+const FREE_EMAIL_PROVIDERS = new Set([
+  'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'live.com',
+  'icloud.com', 'aol.com', 'protonmail.com', 'mail.com', 'yandex.com',
+  'zoho.com', 'gmx.com', 'rediff.com', 'yahoo.co.in', 'rocketmail.com',
+]);
+
+const MESSAGING_PLATFORMS = ['whatsapp', 'telegram', 'signal', 'discord', 'wechat'];
+const JOB_PLATFORMS = ['linkedin', 'indeed', 'glassdoor', 'naukri', 'internshala', 'monster', 'angel.co', 'wellfound'];
+
+const PAYMENT_KEYWORDS = [
+  'registration fee', 'application fee', 'security deposit', 'training fee',
+  'training cost', 'certification fee', 'certificate fee', 'laptop deposit',
+  'equipment deposit', 'equipment fee', 'refundable deposit', 'onboarding fee',
+  'onboarding charge', 'interview fee', 'registration charge', 'processing fee',
+  'security money', 'deposit', 'advance payment', 'upfront payment', 'fee of',
+  'pay ₹', 'pay rs', 'pay $', 'transfer funds', 'wire transfer', 'bank transfer',
+  'gift card', 'amazon gift', 'itunes gift', 'google play gift', 'bitcoin',
+  'cryptocurrency', 'crypto payment', 'usdt', 'ether', 'wire money', 'send money',
+  'registration amount', 'fee for', 'payment required', 'pay for',
+  'training charges', 'course fee', 'course fee',
+];
+
+const PRESSURE_KEYWORDS = [
+  'urgent', 'immediately', 'asap', 'right away', 'limited time', 'offer expires',
+  'act now', 'respond quickly', 'quick response', 'deadline', 'last chance',
+  'hurry', 'don\'t miss', 'closing soon', 'apply now or',
+];
+
+const SCAM_JOB_KEYWORDS = [
+  'no experience required', 'no experience needed', 'no skills required',
+  'no interview required', 'guaranteed income', 'guaranteed job',
+  'guaranteed employment', 'instant selection', 'immediate selection',
+  'selected immediately', 'work from home', 'earn money online',
+  'easy money', 'get rich', 'earn ₹', 'earn $', 'per day', 'per week',
+  'data entry jobs', 'typing jobs', 'form filling', 'captcha work',
+  'unlimited earning', 'be your own boss',
+];
+
+const BRAND_NAMES = [
+  'amazon', 'google', 'microsoft', 'apple', 'facebook', 'meta', 'netflix',
+  'ibm', 'oracle', 'salesforce', 'adobe', 'intel', 'cisco', 'tesla',
+  'walmart', 'target', 'jpmorgan', 'goldman sachs', 'morgan stanley',
+  'deloitte', 'ey', 'pwc', 'kpmg', 'accenture', 'capgemini', 'tata',
+  'infosys', 'wipro', 'tcs', 'hcl', 'cognizant', 'flipkart', 'swiggy',
+  'zomato', 'paytm', 'phonepe', 'reliance', 'airtel', 'jio',
+];
+
+const GOVERNMENT_KEYWORDS = [
+  'government approved', 'govt approved', 'msme approved', 'msme registered',
+  'aicte approved', 'aicte', 'government recognized', 'govt recognized',
+  'ministry of', 'official partner of', 'affiliated with government',
+  'government internship', 'govt internship', 'niti aayog',
+];
+
+const SENSITIVE_INFO_KEYWORDS = [
+  'aadhaar', 'pan card', 'ssn', 'social security', 'passport',
+  'bank account', 'bank details', 'banking details', 'credit card',
+  'debit card', 'identity proof', 'id proof', 'photograph',
+  'driving license', 'voter id', 'ration card',
+];
+
+let findingCounter = 0;
+function nextId(): string {
+  findingCounter += 1;
+  return `finding-${findingCounter}`;
+}
+
+function containsAny(text: string, keywords: string[]): string[] {
+  const lower = text.toLowerCase();
+  return keywords.filter((k) => lower.includes(k));
+}
+
+function detectLookalikeDomain(emailDomain: string, companyDomain: string): boolean {
+  if (!emailDomain || !companyDomain) return false;
+  if (emailDomain === companyDomain) return false;
+  const levenshtein = (a: string, b: string): number => {
+    const m = a.length;
+    const n = b.length;
+    const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+    for (let i = 0; i <= m; i++) dp[i][0] = i;
+    for (let j = 0; j <= n; j++) dp[0][j] = j;
+    for (let i = 1; i <= m; i++) {
+      for (let j = 1; j <= n; j++) {
+        dp[i][j] = a[i - 1] === b[j - 1]
+          ? dp[i - 1][j - 1]
+          : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+      }
+    }
+    return dp[m][n];
+  };
+  const dist = levenshtein(emailDomain, companyDomain);
+  return dist > 0 && dist <= 3 && emailDomain.length > 5;
+}
+
+function isSubdomain(domain: string, rootDomain: string): boolean {
+  return domain !== rootDomain && domain.endsWith(`.${rootDomain}`);
+}
+
+function computeRiskLevel(score: number): RiskLevel {
+  if (score <= 20) return 'LOW RISK';
+  if (score <= 40) return 'GENERALLY LOW RISK';
+  if (score <= 60) return 'CAUTION';
+  if (score <= 80) return 'HIGH RISK';
+  return 'VERY HIGH RISK';
+}
+
+interface CategoryAnalysis {
+  category: string;
+  status: CategoryResult['status'];
+  confidence: CategoryResult['confidence'];
+  riskLevel: CategoryResult['riskLevel'];
+  findings: Finding[];
+  positives: Finding[];
+  gaps: string[];
+  scoreContribution: number;
+}
+
+function analyzeCompany(input: OpportunityInput): CategoryAnalysis {
+  const findings: Finding[] = [];
+  const positives: Finding[] = [];
+  const gaps: string[] = [];
+  let scoreContribution = 0;
+
+  if (!input.company.trim()) {
+    gaps.push('Company name was not provided');
+    return {
+      category: 'Company Verification',
+      status: 'unable', confidence: 'none', riskLevel: 'low',
+      findings, positives, gaps, scoreContribution: 5,
+    };
+  }
+
+  if (!input.companyWebsite.trim()) {
+    findings.push({
+      id: nextId(),
+      category: 'company',
+      severity: 'caution',
+      title: `No website provided for "${input.company}"`,
+      finding: `No official website was supplied for ${input.company}.`,
+      evidence: input.company,
+      explanation: 'A legitimate company typically has an official website that can be independently verified.',
+      action: 'Search for the company\'s official website independently and verify it matches the claimed company.',
+    });
+    scoreContribution += 10;
+    gaps.push('Whether the company exists');
+    gaps.push('Whether the opportunity is consistent with the company');
+  }
+
+  if (input.companyWebsite.trim()) {
+    const domain = getDomainFromUrl(input.companyWebsite);
+    if (domain) {
+      const companyNameSlug = input.company.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const domainSlug = domain.split('.')[0];
+      const isConsistent = domainSlug.includes(companyNameSlug.slice(0, 4)) ||
+        companyNameSlug.includes(domainSlug.slice(0, 4));
+      if (isConsistent) {
+        positives.push({
+          id: nextId(),
+          category: 'company',
+          severity: 'positive',
+          title: 'Company website appears consistent',
+          finding: 'The supplied company website domain appears to match the company name.',
+          evidence: `${input.company} — ${input.companyWebsite}`,
+          explanation: 'A matching domain is a positive signal, though it should still be independently verified.',
+          action: 'Visit the website and confirm it is active and professional.',
+        });
+      } else {
+        findings.push({
+          id: nextId(),
+          category: 'company',
+          severity: 'caution',
+          title: `Website domain "${domain}" doesn't obviously match "${input.company}"`,
+          finding: `The website you gave for ${input.company} (${domain}) doesn't clearly match the company name.`,
+          evidence: `${input.company} — ${input.companyWebsite}`,
+          explanation: 'This can be legitimate if the company uses a different brand name for its domain, but it warrants verification.',
+          action: 'Verify the website is genuinely operated by the claimed company.',
+        });
+        scoreContribution += 8;
+      }
+    }
+    gaps.push('Whether the company is actively operating');
+  }
+
+  if (input.company.trim().length < 3) {
+    findings.push({
+      id: nextId(),
+      category: 'company',
+      severity: 'caution',
+      title: `Company name "${input.company}" is unusually short or generic`,
+      finding: `The company name provided ("${input.company}") is very short or generic.`,
+      evidence: input.company,
+      explanation: 'Vague or generic company names make it harder to verify the employer.',
+      action: 'Ask the recruiter for the full registered company name.',
+    });
+    scoreContribution += 5;
+  }
+
+  const companyLower = input.company.toLowerCase();
+  const brandClaimed = BRAND_NAMES.find((b) => companyLower.includes(b));
+  if (brandClaimed && input.recruiterEmail.trim()) {
+    const emailDomain = getDomainFromEmail(input.recruiterEmail);
+    if (emailDomain && FREE_EMAIL_PROVIDERS.has(emailDomain)) {
+      findings.push({
+        id: nextId(),
+        category: 'company',
+        severity: 'high',
+        title: `Claims to be "${brandClaimed}" but recruiter uses a personal email`,
+        finding: `The opportunity claims affiliation with "${brandClaimed}" but the recruiter uses a free email provider.`,
+        evidence: `${input.recruiterEmail}`,
+        explanation: 'Recruiters from major companies typically use official company email domains, not personal email services.',
+        action: 'Contact the company through its official website to verify this recruiter.',
+      });
+      scoreContribution += 20;
+    }
+  }
+
+  return {
+    category: 'Company Verification',
+    status: gaps.length > 0 ? 'unable' : 'partial',
+    confidence: gaps.length > 0 ? 'low' : 'medium',
+    riskLevel: scoreContribution > 15 ? 'high' : scoreContribution > 5 ? 'caution' : 'low',
+    findings, positives, gaps, scoreContribution,
+  };
+}
+
+function analyzeRecruiterIdentity(input: OpportunityInput): CategoryAnalysis {
+  const findings: Finding[] = [];
+  const positives: Finding[] = [];
+  const gaps: string[] = [];
+  let scoreContribution = 0;
+
+  if (!input.recruiterName.trim()) {
+    gaps.push('Recruiter name was not provided');
+  }
+
+  if (input.recruiterMessage.trim()) {
+    const msgLower = input.recruiterMessage.toLowerCase();
+    const pressureHits = containsAny(input.recruiterMessage, PRESSURE_KEYWORDS);
+    if (pressureHits.length > 0) {
+      findings.push({
+        id: nextId(),
+        category: 'recruiter',
+        severity: pressureHits.length > 2 ? 'high' : 'caution',
+        title: 'Pressure tactics detected in communication',
+        finding: 'The recruiter message uses urgency or pressure language.',
+        evidence: pressureHits.slice(0, 3).map((k) => `"${k}"`).join(', '),
+        explanation: 'Pressuring candidates to respond quickly is a common tactic in fraudulent recruitment.',
+        action: 'Take your time. Legitimate employers do not pressure candidates to make immediate decisions.',
+      });
+      scoreContribution += pressureHits.length > 2 ? 15 : 8;
+    }
+
+    const scamHits = containsAny(input.recruiterMessage, SCAM_JOB_KEYWORDS);
+    if (scamHits.length > 0) {
+      findings.push({
+        id: nextId(),
+        category: 'recruiter',
+        severity: scamHits.length > 2 ? 'high' : 'caution',
+        title: 'Common scam job phrases detected',
+        finding: 'The message contains phrases commonly associated with fraudulent job postings.',
+        evidence: scamHits.slice(0, 3).map((k) => `"${k}"`).join(', '),
+        explanation: 'Promises of easy money, no experience needed, or guaranteed income are major red flags.',
+        action: 'Be very cautious. Legitimate jobs rarely guarantee income or require no experience.',
+      });
+      scoreContribution += scamHits.length > 2 ? 15 : 8;
+    }
+
+    const platformHits = MESSAGING_PLATFORMS.filter((p) => msgLower.includes(p));
+    if (platformHits.length > 0) {
+      findings.push({
+        id: nextId(),
+        category: 'recruiter',
+        severity: 'caution',
+        title: 'Messaging app as primary contact channel',
+        finding: `The recruiter asks to communicate via ${platformHits.join(', ')}.`,
+        evidence: platformHits.map((p) => `"${p}"`).join(', '),
+        explanation: 'While some legitimate recruiters use messaging apps, making them the sole or primary communication channel is a risk indicator.',
+        action: 'Verify the recruiter through official company channels before sharing information.',
+      });
+      scoreContribution += 8;
+    }
+
+    if (input.recruiterName.trim() && msgLower.includes(input.recruiterName.toLowerCase().split(' ')[0])) {
+      positives.push({
+        id: nextId(),
+        category: 'recruiter',
+        severity: 'positive',
+        title: 'Recruiter name is present in communication',
+        finding: 'The recruiter message includes the recruiter\'s name, suggesting personal communication.',
+        evidence: input.recruiterName,
+        explanation: 'Personalized communication is slightly more reassuring than generic mass outreach.',
+        action: 'Still verify the recruiter independently.',
+      });
+    }
+
+    const msgWords = input.recruiterMessage.trim().split(/\s+/);
+    if (msgWords.length < 20 && msgWords.length > 0) {
+      findings.push({
+        id: nextId(),
+        category: 'recruiter',
+        severity: 'low',
+        title: 'Very short recruiter message',
+        finding: 'The recruiter message is unusually brief.',
+        evidence: `${msgWords.length} words`,
+        explanation: 'Very short messages may indicate mass outreach or lack of personalization.',
+        action: 'Ask for more details about the role and company.',
+      });
+      scoreContribution += 3;
+    }
+
+    if (!input.recruiterName.trim() && input.recruiterMessage.trim()) {
+      findings.push({
+        id: nextId(),
+        category: 'recruiter',
+        severity: 'caution',
+        title: 'No recruiter name provided',
+        finding: 'The recruiter message does not include an identifiable recruiter name.',
+        evidence: 'No name in recruiter message field',
+        explanation: 'Anonymous recruitment is harder to verify and is a mild risk indicator.',
+        action: 'Ask the recruiter for their full name, title, and company email address.',
+      });
+      scoreContribution += 5;
+    }
+  }
+
+  return {
+    category: 'Recruiter Identity',
+    status: gaps.length > 0 ? 'unable' : 'partial',
+    confidence: gaps.length > 0 ? 'low' : 'medium',
+    riskLevel: scoreContribution > 15 ? 'high' : scoreContribution > 5 ? 'caution' : 'low',
+    findings, positives, gaps, scoreContribution,
+  };
+}
+
+function analyzeEmailDomain(input: OpportunityInput): CategoryAnalysis {
+  const findings: Finding[] = [];
+  const positives: Finding[] = [];
+  const gaps: string[] = [];
+  let scoreContribution = 0;
+
+  const emailDomain = input.recruiterEmail.trim() ? getDomainFromEmail(input.recruiterEmail) : null;
+  const websiteDomain = input.companyWebsite.trim() ? getDomainFromUrl(input.companyWebsite) : null;
+
+  if (!emailDomain) {
+    gaps.push('Recruiter email was not provided');
+    return {
+      category: 'Email / Domain Analysis',
+      status: 'unable', confidence: 'none', riskLevel: 'low',
+      findings, positives, gaps, scoreContribution: 3,
+    };
+  }
+
+  if (FREE_EMAIL_PROVIDERS.has(emailDomain)) {
+    findings.push({
+      id: nextId(),
+      category: 'email',
+      severity: 'caution',
+      title: `Recruiter email is on ${emailDomain}, a free provider`,
+      finding: `The recruiter email uses a free email provider (${emailDomain}).`,
+      evidence: input.recruiterEmail,
+      explanation: 'This is not proof of fraud — many legitimate third-party recruiters use Gmail. However, if the recruiter claims to represent a specific company, the email should ideally come from that company\'s domain.',
+      action: 'If the recruiter claims to represent a company, verify using the company\'s official email domain.',
+    });
+    scoreContribution += 10;
+
+    if (websiteDomain && websiteDomain !== emailDomain) {
+      findings.push({
+        id: nextId(),
+        category: 'email',
+        severity: 'high',
+        title: `Email domain “${emailDomain}” doesn't match “${websiteDomain}”`,
+        finding: `The recruiter's email (${emailDomain}) uses a different domain from ${input.company}'s website (${websiteDomain}).`,
+        evidence: `Email: ${emailDomain} vs Website: ${websiteDomain}`,
+        explanation: 'The recruiter uses a different domain from the company. This can be legitimate for third-party recruiters, but independently verify the relationship.',
+        action: 'Contact the company directly through their official website to confirm the recruiter\'s affiliation.',
+      });
+      scoreContribution += 12;
+    }
+  } else if (websiteDomain) {
+    if (emailDomain === websiteDomain) {
+      positives.push({
+        id: nextId(),
+        category: 'email',
+        severity: 'positive',
+        title: `Email domain matches ${input.company}'s website`,
+        finding: `The recruiter email domain (${emailDomain}) matches the company website domain.`,
+        evidence: `${emailDomain} = ${websiteDomain}`,
+        explanation: 'A matching domain is a strong positive signal that the recruiter is genuinely affiliated with the company.',
+        action: 'Still verify the specific recruiter through the company\'s official channels.',
+      });
+    } else if (isSubdomain(emailDomain, websiteDomain) || isSubdomain(websiteDomain, emailDomain)) {
+      positives.push({
+        id: nextId(),
+        category: 'email',
+        severity: 'positive',
+        title: `Email domain “${emailDomain}” is related to “${websiteDomain}”`,
+        finding: `The recruiter email domain (${emailDomain}) is a subdomain or parent of the company website domain (${websiteDomain}).`,
+        evidence: `${emailDomain} ~ ${websiteDomain}`,
+        explanation: 'Related domains suggest the email is from the same organization.',
+        action: 'Verify through official channels for full confidence.',
+      });
+    } else if (detectLookalikeDomain(emailDomain, websiteDomain)) {
+      findings.push({
+        id: nextId(),
+        category: 'email',
+        severity: 'critical',
+        title: `“${emailDomain}” closely resembles “${websiteDomain}” but isn't identical`,
+        finding: `The recruiter email domain (${emailDomain}) closely resembles ${input.company}'s domain (${websiteDomain}) but is not identical.`,
+        evidence: `${emailDomain} vs ${websiteDomain}`,
+        explanation: 'Lookalike domains (e.g., "arnazon.com" instead of "amazon.com") are a hallmark of impersonation scams.',
+        action: 'Do not respond until you have independently verified the correct company domain.',
+      });
+      scoreContribution += 25;
+    } else {
+      findings.push({
+        id: nextId(),
+        category: 'email',
+        severity: 'caution',
+        title: `Email domain “${emailDomain}” differs from “${websiteDomain}”`,
+        finding: `The recruiter email domain (${emailDomain}) is different from the company website domain (${websiteDomain}).`,
+        evidence: `${emailDomain} vs ${websiteDomain}`,
+        explanation: 'This may be legitimate for staffing agencies, but should be verified independently.',
+        action: 'Verify the recruiter\'s relationship with the company.',
+      });
+      scoreContribution += 10;
+    }
+  }
+
+  if (emailDomain && emailDomain.split('.').length > 4) {
+    findings.push({
+      id: nextId(),
+      category: 'email',
+      severity: 'caution',
+      title: 'Unusual email domain pattern',
+      finding: 'The email domain has an unusually long subdomain structure.',
+      evidence: emailDomain,
+      explanation: 'Complex subdomain patterns can be used to disguise the true origin of an email.',
+      action: 'Verify the domain independently.',
+    });
+    scoreContribution += 5;
+  }
+
+  return {
+    category: 'Email / Domain Analysis',
+    status: findings.some((f) => f.severity === 'critical') ? 'suspicious' : 'partial',
+    confidence: findings.length === 0 ? 'high' : 'medium',
+    riskLevel: scoreContribution > 20 ? 'high' : scoreContribution > 8 ? 'caution' : 'low',
+    findings, positives, gaps, scoreContribution,
+  };
+}
+
+function analyzeJobPosting(input: OpportunityInput): CategoryAnalysis {
+  const findings: Finding[] = [];
+  const positives: Finding[] = [];
+  const gaps: string[] = [];
+  let scoreContribution = 0;
+
+  const text = `${input.description} ${input.recruiterMessage} ${input.offerLetter}`;
+
+  if (!input.description.trim() && !input.recruiterMessage.trim()) {
+    gaps.push('Job description and recruiter message were not provided');
+    return {
+      category: 'Job Posting Analysis',
+      status: 'unable', confidence: 'none', riskLevel: 'low',
+      findings, positives, gaps, scoreContribution: 5,
+    };
+  }
+
+  const scamHits = containsAny(text, SCAM_JOB_KEYWORDS);
+  if (scamHits.length > 0) {
+    findings.push({
+      id: nextId(),
+      category: 'job',
+      severity: scamHits.length > 2 ? 'high' : 'caution',
+      title: scamHits.length > 2 ? 'Multiple unrealistic job promises' : 'Unrealistic job promise detected',
+      finding: 'The job posting contains language commonly associated with misleading or fraudulent postings.',
+      evidence: scamHits.slice(0, 4).map((k) => `"${k}"`).join(', '),
+      explanation: 'Promises like "no experience required" combined with high pay, guaranteed income, or instant selection are major warning signs.',
+      action: 'Be cautious. Research the company and role independently.',
+    });
+    scoreContribution += scamHits.length > 2 ? 15 : 8;
+  }
+
+  if (input.description.trim()) {
+    const words = input.description.trim().split(/\s+/);
+    if (words.length < 30) {
+      findings.push({
+        id: nextId(),
+        category: 'job',
+        severity: 'caution',
+        title: 'Job description is very short',
+        finding: 'The job description is unusually brief.',
+        evidence: `${words.length} words`,
+        explanation: 'Vague or extremely short descriptions make it hard to assess the legitimacy of the role.',
+        action: 'Ask for a detailed job description with specific responsibilities and requirements.',
+      });
+      scoreContribution += 5;
+    } else {
+      positives.push({
+        id: nextId(),
+        category: 'job',
+        severity: 'positive',
+        title: 'Detailed job description provided',
+        finding: 'The job description has enough detail to assess the role.',
+        evidence: `${words.length} words`,
+        explanation: 'A detailed description allows for better assessment of the opportunity.',
+        action: 'Verify the details against the company\'s official careers page.',
+      });
+    }
+  }
+
+  if (input.jobTitle.trim()) {
+    const titleLower = input.jobTitle.toLowerCase();
+    if (titleLower.includes('data entry') && text.toLowerCase().includes('work from home')) {
+      findings.push({
+        id: nextId(),
+        category: 'job',
+        severity: 'high',
+        title: 'Data entry + work from home pattern',
+        finding: 'The role involves data entry with work from home, a pattern commonly seen in fraudulent postings.',
+        evidence: input.jobTitle,
+        explanation: 'Data entry work-from-home jobs are frequently used in scams that ask for upfront deposits.',
+        action: 'Be extremely cautious and verify the company independently.',
+      });
+      scoreContribution += 15;
+    }
+  }
+
+  if (input.jobPostingUrl.trim()) {
+    const url = input.jobPostingUrl.toLowerCase();
+    const onPlatform = JOB_PLATFORMS.some((p) => url.includes(p));
+    if (onPlatform) {
+      positives.push({
+        id: nextId(),
+        category: 'job',
+        severity: 'positive',
+        title: 'Job posted on a recognized platform',
+        finding: 'The job posting URL links to a recognized job platform.',
+        evidence: input.jobPostingUrl,
+        explanation: 'Jobs on established platforms have some level of platform review, though scams still appear.',
+        action: 'Check the poster\'s profile on the platform for authenticity.',
+      });
+    }
+  }
+
+  return {
+    category: 'Job Posting Analysis',
+    status: findings.some((f) => f.severity === 'high') ? 'suspicious' : 'partial',
+    confidence: positives.length > 0 ? 'medium' : 'low',
+    riskLevel: scoreContribution > 15 ? 'high' : scoreContribution > 5 ? 'caution' : 'low',
+    findings, positives, gaps, scoreContribution,
+  };
+}
+
+function analyzePayment(text: string): CategoryAnalysis {
+  const findings: Finding[] = [];
+  const positives: Finding[] = [];
+  const gaps: string[] = [];
+  let scoreContribution = 0;
+
+  if (!text.trim()) {
+    gaps.push('No offer letter or additional information provided');
+    return {
+      category: 'Payment / Money Detection',
+      status: 'unable', confidence: 'none', riskLevel: 'low',
+      findings, positives, gaps, scoreContribution: 0,
+    };
+  }
+
+  const paymentHits = containsAny(text, PAYMENT_KEYWORDS);
+  if (paymentHits.length > 0) {
+    findings.push({
+      id: nextId(),
+      category: 'payment',
+      severity: 'critical',
+      title: `Asked to pay: "${paymentHits[0]}"`,
+      finding: `The opportunity mentions "${paymentHits[0]}"${paymentHits.length > 1 ? ` and ${paymentHits.length - 1} other payment-related phrase${paymentHits.length > 2 ? 's' : ''}` : ''} — a payment before employment or internship begins.`,
+      evidence: paymentHits.slice(0, 4).map((k) => `"${k}"`).join(', '),
+      explanation: 'Legitimate opportunities can have paid training or other costs in some contexts, but unexpected upfront payments are a major warning sign and should be independently verified.',
+      action: 'Do not pay until you have independently verified the opportunity through official company channels.',
+    });
+    scoreContribution += 30;
+  }
+
+  const amountMatch = text.match(/[₹$€£]\s*[\d,]+/g);
+  if (amountMatch && paymentHits.length > 0) {
+    findings.push({
+      id: nextId(),
+      category: 'payment',
+      severity: 'high',
+      title: `Specific amount requested: ${amountMatch[0]}`,
+      finding: `A specific amount (${amountMatch.slice(0, 3).join(', ')}) is mentioned alongside payment-related language.`,
+      evidence: amountMatch.slice(0, 3).join(', '),
+      explanation: 'Requests for specific upfront amounts are a hallmark of advance-fee fraud.',
+      action: 'Do not transfer any money. Verify the opportunity independently first.',
+    });
+    scoreContribution += 10;
+  }
+
+  if (paymentHits.length === 0 && text.trim().length > 50) {
+    positives.push({
+      id: nextId(),
+      category: 'payment',
+      severity: 'positive',
+      title: 'No payment requests detected',
+      finding: 'No upfront payment, deposit, or fee requests were detected in the provided text.',
+      evidence: 'Scanned offer letter and additional information',
+      explanation: 'The absence of payment requests is a positive signal.',
+      action: 'Remain cautious and verify all other aspects of the opportunity.',
+    });
+  }
+
+  return {
+    category: 'Payment / Money Detection',
+    status: paymentHits.length > 0 ? 'suspicious' : 'partial',
+    confidence: paymentHits.length > 0 ? 'high' : 'medium',
+    riskLevel: scoreContribution > 20 ? 'high' : scoreContribution > 0 ? 'caution' : 'low',
+    findings, positives, gaps, scoreContribution,
+  };
+}
+
+function analyzeRecruitmentProcess(input: OpportunityInput): CategoryAnalysis {
+  const findings: Finding[] = [];
+  const positives: Finding[] = [];
+  const gaps: string[] = [];
+  let scoreContribution = 0;
+
+  const text = `${input.description} ${input.recruiterMessage} ${input.offerLetter}`;
+  const lower = text.toLowerCase();
+
+  if (!text.trim()) {
+    gaps.push('No process information provided');
+    return {
+      category: 'Recruitment Process',
+      status: 'unable', confidence: 'none', riskLevel: 'low',
+      findings, positives, gaps, scoreContribution: 3,
+    };
+  }
+
+  if (lower.includes('no interview') || lower.includes('without interview') || lower.includes('no interview required')) {
+    findings.push({
+      id: nextId(),
+      category: 'process',
+      severity: 'high',
+      title: 'No formal interview mentioned',
+      finding: 'The opportunity appears to proceed without a formal interview.',
+      evidence: '"no interview" detected in text',
+      explanation: 'Legitimate employers typically conduct interviews. Selection without any interview is a major red flag.',
+      action: 'Ask about the interview process. A legitimate employer will have one.',
+    });
+    scoreContribution += 15;
+  }
+
+  if (lower.includes('instant') || lower.includes('immediately selected') || lower.includes('selected on the spot')) {
+    findings.push({
+      id: nextId(),
+      category: 'process',
+      severity: 'high',
+      title: 'Instant selection detected',
+      finding: 'The opportunity suggests immediate or instant selection.',
+      evidence: 'Instant/immediate selection language detected',
+      explanation: 'Selection without meaningful evaluation is a common sign of fraudulent recruitment.',
+      action: 'Be cautious. Legitimate hiring takes time and involves evaluation.',
+    });
+    scoreContribution += 12;
+  }
+
+  if (lower.includes('interview') && (lower.includes('round') || lower.includes('technical') || lower.includes('hr round'))) {
+    positives.push({
+      id: nextId(),
+      category: 'process',
+      severity: 'positive',
+      title: 'Formal interview process described',
+      finding: 'The opportunity mentions a formal interview process.',
+      evidence: 'Interview-related language detected',
+      explanation: 'A described interview process is a positive signal for legitimacy.',
+      action: 'Confirm the interview details through official channels.',
+    });
+  }
+
+  if (lower.includes('offer letter') && !lower.includes('interview')) {
+    findings.push({
+      id: nextId(),
+      category: 'process',
+      severity: 'caution',
+      title: 'Offer letter without interview mentioned',
+      finding: 'An offer letter is mentioned but no interview process is described.',
+      evidence: 'Offer letter referenced without interview context',
+      explanation: 'An offer without a preceding interview is unusual for legitimate hiring.',
+      action: 'Verify whether an interview is part of the process.',
+    });
+    scoreContribution += 10;
+  }
+
+  const accountKeywords = ['create an account', 'register on', 'sign up on', 'create your profile on'];
+  const accountHits = containsAny(lower, accountKeywords);
+  if (accountHits.length > 0) {
+    findings.push({
+      id: nextId(),
+      category: 'process',
+      severity: 'caution',
+      title: 'Asked to create account on external platform',
+      finding: 'The recruiter asks candidates to create an account on a specific platform.',
+      evidence: accountHits.slice(0, 2).map((k) => `"${k}"`).join(', '),
+      explanation: 'Directing candidates to unfamiliar platforms can be a way to collect personal information.',
+      action: 'Verify the platform is legitimate before creating an account.',
+    });
+    scoreContribution += 8;
+  }
+
+  if (lower.includes('download') && (lower.includes('app') || lower.includes('software'))) {
+    findings.push({
+      id: nextId(),
+      category: 'process',
+      severity: 'caution',
+      title: 'Asked to download software',
+      finding: 'The process requires downloading an app or software.',
+      evidence: 'Download instructions detected',
+      explanation: 'Requests to download unknown software can be a vector for malware or scams.',
+      action: 'Verify the software is legitimate and from an official source before downloading.',
+    });
+    scoreContribution += 5;
+  }
+
+  return {
+    category: 'Recruitment Process',
+    status: findings.some((f) => f.severity === 'high') ? 'suspicious' : 'partial',
+    confidence: findings.length > 0 ? 'medium' : 'low',
+    riskLevel: scoreContribution > 15 ? 'high' : scoreContribution > 5 ? 'caution' : 'low',
+    findings, positives, gaps, scoreContribution,
+  };
+}
+
+function analyzeBrandImpersonation(input: OpportunityInput): CategoryAnalysis {
+  const findings: Finding[] = [];
+  const positives: Finding[] = [];
+  const gaps: string[] = [];
+  let scoreContribution = 0;
+
+  const text = `${input.company} ${input.description} ${input.recruiterMessage} ${input.offerLetter}`;
+  const lower = text.toLowerCase();
+
+  const brandFound = BRAND_NAMES.find((b) => lower.includes(b));
+  const govFound = GOVERNMENT_KEYWORDS.filter((k) => lower.includes(k));
+
+  if (!brandFound && govFound.length === 0) {
+    return {
+      category: 'Brand / Government Affiliation',
+      status: 'partial', confidence: 'medium', riskLevel: 'low',
+      findings, positives, gaps, scoreContribution: 0,
+    };
+  }
+
+  if (brandFound) {
+    const emailDomain = input.recruiterEmail.trim() ? getDomainFromEmail(input.recruiterEmail) : null;
+    if (emailDomain && FREE_EMAIL_PROVIDERS.has(emailDomain)) {
+      findings.push({
+        id: nextId(),
+        category: 'brand',
+        severity: 'high',
+        title: 'Affiliation could not be independently verified',
+        finding: `The opportunity claims affiliation with "${brandFound}" but the recruiter uses a personal email.`,
+        evidence: `Brand: ${brandFound}, Email: ${input.recruiterEmail}`,
+        explanation: 'Recruiters from major brands typically use official company email. The affiliation could not be independently verified.',
+        action: 'Contact the company through its official website to verify this relationship.',
+      });
+      scoreContribution += 15;
+    } else {
+      gaps.push(`Relationship with "${brandFound}" could not be independently verified`);
+    }
+  }
+
+  if (govFound.length > 0) {
+    findings.push({
+      id: nextId(),
+      category: 'brand',
+      severity: 'caution',
+      title: 'Government affiliation claim detected',
+      finding: 'The opportunity claims a government, MSME, or AICTE affiliation.',
+      evidence: govFound.slice(0, 2).map((k) => `"${k}"`).join(', '),
+      explanation: 'Government affiliation claims should be independently verified through official government portals. Do not assume the claim is accurate.',
+      action: 'Verify the affiliation through the relevant official government or regulatory website.',
+    });
+    scoreContribution += 10;
+  }
+
+  if (brandFound && input.companyWebsite.trim()) {
+    const domain = getDomainFromUrl(input.companyWebsite);
+    if (domain && !domain.includes(brandFound.slice(0, 4))) {
+      findings.push({
+        id: nextId(),
+        category: 'brand',
+        severity: 'high',
+        title: 'Brand name does not match website domain',
+        finding: `The opportunity claims affiliation with "${brandFound}" but the website does not match.`,
+        evidence: `Brand: ${brandFound}, Website: ${input.companyWebsite}`,
+        explanation: 'A mismatch between a claimed brand affiliation and the website domain is a significant red flag for impersonation.',
+        action: 'Verify the brand\'s official website independently and compare.',
+      });
+      scoreContribution += 15;
+    }
+  }
+
+  return {
+    category: 'Brand / Government Affiliation',
+    status: findings.length > 0 ? 'suspicious' : 'partial',
+    confidence: findings.length > 0 ? 'medium' : 'low',
+    riskLevel: scoreContribution > 10 ? 'high' : scoreContribution > 0 ? 'caution' : 'low',
+    findings, positives, gaps, scoreContribution,
+  };
+}
+
+function analyzeOfferLetter(input: OpportunityInput): CategoryAnalysis {
+  const findings: Finding[] = [];
+  const positives: Finding[] = [];
+  const gaps: string[] = [];
+  let scoreContribution = 0;
+
+  if (!input.offerLetter.trim()) {
+    gaps.push('No offer letter text was provided');
+    return {
+      category: 'Offer Letter Analysis',
+      status: 'unable', confidence: 'none', riskLevel: 'low',
+      findings, positives, gaps, scoreContribution: 0,
+    };
+  }
+
+  const text = input.offerLetter;
+  const lower = text.toLowerCase();
+
+  if (!lower.includes('date')) {
+    findings.push({
+      id: nextId(),
+      category: 'offer',
+      severity: 'caution',
+      title: 'Missing date in offer letter',
+      finding: 'The offer letter does not appear to include a date.',
+      evidence: 'No date reference detected',
+      explanation: 'Legitimate offer letters typically include the date of issuance.',
+      action: 'Ask for a dated offer letter on company letterhead.',
+    });
+    scoreContribution += 5;
+  }
+
+  if (input.company.trim() && !lower.includes(input.company.toLowerCase())) {
+    findings.push({
+      id: nextId(),
+      category: 'offer',
+      severity: 'caution',
+      title: 'Company name not mentioned in offer letter',
+      finding: 'The claimed company name does not appear in the offer letter text.',
+      evidence: `Expected "${input.company}" in offer letter`,
+      explanation: 'A legitimate offer letter should reference the employer\'s name.',
+      action: 'Ask for an offer letter on official company letterhead.',
+    });
+    scoreContribution += 8;
+  }
+
+  if (!lower.includes('salary') && !lower.includes('stipend') && !lower.includes('compensation') && !lower.includes('pay')) {
+    findings.push({
+      id: nextId(),
+      category: 'offer',
+      severity: 'caution',
+      title: 'Missing compensation information',
+      finding: 'The offer letter does not clearly state salary, stipend, or compensation.',
+      evidence: 'No compensation keywords detected',
+      explanation: 'A legitimate offer letter should clearly state compensation details.',
+      action: 'Request a written offer with clear compensation details.',
+    });
+    scoreContribution += 5;
+  }
+
+  const genericPhrases = ['dear candidate', 'dear applicant', 'congratulations on being selected', 'we are pleased to offer'];
+  const genericHits = containsAny(lower, genericPhrases);
+  if (genericHits.length >= 2) {
+    findings.push({
+      id: nextId(),
+      category: 'offer',
+      severity: 'caution',
+      title: 'Generic/template language detected',
+      finding: 'Several responsibilities are described broadly without identifying a specific project, team, manager, or deliverable.',
+      evidence: genericHits.map((k) => `"${k}"`).join(', '),
+      explanation: 'Heavy use of generic boilerplate language can indicate a template-based offer rather than a genuine, role-specific letter.',
+      action: 'Request a detailed offer letter with specific role and project information.',
+    });
+    scoreContribution += 8;
+  }
+
+  const paymentHits = containsAny(text, PAYMENT_KEYWORDS);
+  if (paymentHits.length > 0) {
+    findings.push({
+      id: nextId(),
+      category: 'offer',
+      severity: 'critical',
+      title: 'Payment requirement in offer letter',
+      finding: 'The offer letter contains a payment or deposit requirement.',
+      evidence: paymentHits.slice(0, 3).map((k) => `"${k}"`).join(', '),
+      explanation: 'Payment requirements in an offer letter are a major red flag.',
+      action: 'Do not pay any amount. Verify the company independently first.',
+    });
+    scoreContribution += 20;
+  }
+
+  if (lower.includes('salary') || lower.includes('stipend')) {
+    positives.push({
+      id: nextId(),
+      category: 'offer',
+      severity: 'positive',
+      title: 'Compensation details included',
+      finding: 'The offer letter mentions salary or stipend details.',
+      evidence: 'Compensation keywords detected',
+      explanation: 'Including compensation details is a positive signal.',
+      action: 'Verify the compensation is realistic for the role and market.',
+    });
+  }
+
+  if (lower.includes('date') && lower.includes('date')) {
+    positives.push({
+      id: nextId(),
+      category: 'offer',
+      severity: 'positive',
+      title: 'Offer letter appears structured',
+      finding: 'The offer letter includes dates and appears to follow a letter format.',
+      evidence: 'Date and structured format detected',
+      explanation: 'A structured offer letter is more reassuring than a casual message.',
+      action: 'Still verify the letterhead and company independently.',
+    });
+  }
+
+  return {
+    category: 'Offer Letter Analysis',
+    status: findings.some((f) => f.severity === 'critical') ? 'suspicious' : 'partial',
+    confidence: findings.length > 0 ? 'medium' : 'low',
+    riskLevel: scoreContribution > 15 ? 'high' : scoreContribution > 5 ? 'caution' : 'low',
+    findings, positives, gaps, scoreContribution,
+  };
+}
+
+function analyzeSensitiveInfo(input: OpportunityInput): CategoryAnalysis {
+  const findings: Finding[] = [];
+  const gaps: string[] = [];
+  let scoreContribution = 0;
+
+  const text = `${input.description} ${input.recruiterMessage} ${input.offerLetter}`;
+  const hits = containsAny(text, SENSITIVE_INFO_KEYWORDS);
+
+  if (hits.length > 0) {
+    findings.push({
+      id: nextId(),
+      category: 'sensitive',
+      severity: 'high',
+      title: 'Sensitive information requested',
+      finding: 'The opportunity appears to request sensitive personal or financial information.',
+      evidence: hits.slice(0, 3).map((k) => `"${k}"`).join(', '),
+      explanation: 'Requests for sensitive information (ID numbers, bank details) early in the process are a significant warning sign.',
+      action: 'Avoid submitting identity, banking, or other sensitive information until the employer is independently verified.',
+    });
+    scoreContribution += 15;
+  }
+
+  return {
+    category: 'Sensitive Information',
+    status: hits.length > 0 ? 'suspicious' : 'partial',
+    confidence: hits.length > 0 ? 'high' : 'medium',
+    riskLevel: scoreContribution > 10 ? 'high' : 'low',
+    findings, positives: [], gaps, scoreContribution,
+  };
+}
+
+function assessOpportunityQuality(input: OpportunityInput): OpportunityQuality {
+  const notes: string[] = [];
+  const text = `${input.description} ${input.recruiterMessage} ${input.offerLetter}`;
+  const lower = text.toLowerCase();
+
+  let qualityScore = 0;
+
+  if (input.description.trim().length < 50) {
+    notes.push('Job description is very brief — unclear responsibilities.');
+    qualityScore -= 1;
+  } else {
+    notes.push('Job description provides some detail.');
+  }
+
+  if (lower.includes('mentor') || lower.includes('mentorship')) {
+    notes.push('Mentorship is mentioned.');
+    qualityScore += 1;
+  } else {
+    notes.push('No mentorship structure mentioned.');
+    qualityScore -= 1;
+  }
+
+  if (lower.includes('certificate') && !lower.includes('salary') && !lower.includes('stipend')) {
+    notes.push('The opportunity appears to be certificate-focused without compensation.');
+    qualityScore -= 2;
+  }
+
+  if (lower.includes('unpaid') || (lower.includes('no stipend') || lower.includes('no salary'))) {
+    notes.push('The opportunity may be unpaid.');
+    qualityScore -= 1;
+  }
+
+  if (lower.includes('sales target') || lower.includes('fundraising') || lower.includes('raise funds')) {
+    notes.push('Sales or fundraising targets are mentioned — may indicate revenue-dependent role.');
+    qualityScore -= 1;
+  }
+
+  if (lower.includes('project') && (lower.includes('team') || lower.includes('manager'))) {
+    notes.push('Specific project/team context is described.');
+    qualityScore += 1;
+  }
+
+  if (lower.includes('interview') || lower.includes('assessment')) {
+    notes.push('A structured selection process is described.');
+    qualityScore += 1;
+  }
+
+  const rating: OpportunityQuality['rating'] =
+    qualityScore >= 2 ? 'Appears Structured' :
+    qualityScore >= 0 ? 'Limited Information' :
+    'Potentially Low Quality';
+
+  return { rating, notes };
+}
+
+function buildSummary(score: number, level: RiskLevel, major: Finding[], caution: Finding[]): string {
+  if (major.length > 0) {
+    return `${level} — ${major.length} major warning sign${major.length > 1 ? 's' : ''} and ${caution.length} caution signal${caution.length > 1 ? 's' : ''} were detected. Review the findings below before proceeding.`;
+  }
+  if (caution.length > 0) {
+    return `${level} — ${caution.length} caution signal${caution.length > 1 ? 's' : ''} detected. No major red flags, but verify the details before proceeding.`;
+  }
+  return `${level} — No significant risk indicators were detected from the information provided. Continue with normal verification.`;
+}
+
+function buildRecommendedAction(findings: Finding[]): string {
+  const hasPayment = findings.some((f) => f.category === 'payment');
+  const hasRecruiterIssue = findings.some((f) => f.category === 'recruiter' && (f.severity === 'high' || f.severity === 'critical'));
+  const hasSensitive = findings.some((f) => f.category === 'sensitive');
+  const hasEmailIssue = findings.some((f) => f.category === 'email' && (f.severity === 'high' || f.severity === 'critical'));
+  const highCount = findings.filter((f) => f.severity === 'high' || f.severity === 'critical').length;
+
+  const actions: string[] = [];
+
+  if (hasPayment) {
+    actions.push('Do not pay or submit sensitive documents yet.');
+  }
+  if (hasSensitive) {
+    actions.push('Avoid submitting identity, banking, or other sensitive information until the employer is independently verified.');
+  }
+  if (hasRecruiterIssue || hasEmailIssue) {
+    actions.push('Find the company\'s official website and contact HR through independently sourced contact information.');
+  }
+  if (highCount === 0) {
+    actions.push('Continue normally, but verify important details through official channels before sharing sensitive information.');
+  }
+  if (actions.length === 0) {
+    actions.push('Verify key details through the company\'s official website before sharing sensitive information.');
+  }
+
+  return actions.join(' ');
+}
+
+/**
+ * This is the security boundary. It takes the FULL analysis (which only
+ * ever exists server-side, in /api/analyze and /api/unlock) and strips it
+ * down to exactly what's safe to send to the browser before payment is
+ * verified — real titles and counts for teasers, but no evidence,
+ * explanation, action text, or full category/quality detail.
+ *
+ * /api/analyze calls this and returns ONLY its output. /api/unlock returns
+ * the full AnalysisResult, but only after verifying a real Razorpay
+ * signature server-side.
+ */
+export function toPublicResult(result: AnalysisResult): PublicAnalysisResult {
+  const previewFinding = result.majorWarnings[0] ?? result.cautionSignals[0] ?? null;
+  const remainingMajor = previewFinding && result.majorWarnings[0] === previewFinding
+    ? result.majorWarnings.slice(1)
+    : result.majorWarnings;
+  const remainingCaution = previewFinding && result.cautionSignals[0] === previewFinding
+    ? result.cautionSignals.slice(1)
+    : result.cautionSignals;
+  const lockedFindings = [...remainingMajor, ...remainingCaution];
+  const criticalLockedCount = remainingMajor.filter((f) => f.severity === 'critical').length;
+
+  const positivePreview = result.positiveSignals[0]
+    ? { id: result.positiveSignals[0].id, title: result.positiveSignals[0].title, severity: result.positiveSignals[0].severity }
+    : null;
+
+  const actionPreview = result.recommendedAction.slice(0, 70).trim();
+
+  return {
+    id: result.id,
+    riskScore: result.riskScore,
+    riskLevel: result.riskLevel,
+    summary: result.summary,
+    previewFinding,
+    lockedFindingTitles: lockedFindings.slice(0, 2).map((f) => ({ id: f.id, title: f.title, severity: f.severity })),
+    totalLockedFindingsCount: lockedFindings.length,
+    criticalLockedCount,
+    majorWarningsCount: result.majorWarnings.length,
+    cautionSignalsCount: result.cautionSignals.length,
+    positivePreview,
+    totalPositiveCount: result.positiveSignals.length,
+    verificationGaps: result.verificationGaps,
+    categoriesTotalCount: result.categories.length,
+    categoriesConcernCount: result.categories.filter((c) => c.status === 'suspicious' || c.riskLevel === 'high').length,
+    qualityRating: result.opportunityQuality.rating,
+    qualityNotesLockedCount: result.opportunityQuality.notes.length,
+    recommendedActionPreview: actionPreview,
+    recommendedActionHasMore: result.recommendedAction.length > actionPreview.length,
+    createdAt: result.createdAt,
+    inputSummary: result.inputSummary,
+  };
+}
+
+export function analyzeOpportunity(input: OpportunityInput): AnalysisResult {
+  findingCounter = 0;
+
+  const categories: CategoryAnalysis[] = [
+    analyzeCompany(input),
+    analyzeRecruiterIdentity(input),
+    analyzeEmailDomain(input),
+    analyzeJobPosting(input),
+    analyzePayment(`${input.offerLetter} ${input.recruiterMessage} ${input.description}`),
+    analyzeRecruitmentProcess(input),
+    analyzeBrandImpersonation(input),
+    analyzeOfferLetter(input),
+    analyzeSensitiveInfo(input),
+  ];
+
+  const allFindings = categories.flatMap((c) => c.findings);
+  const allPositives = categories.flatMap((c) => c.positives);
+  const allGaps = categories.flatMap((c) => c.gaps);
+
+  const totalScore = Math.min(100, categories.reduce((sum, c) => sum + c.scoreContribution, 0));
+  const score = Math.round(totalScore);
+  const riskLevel = computeRiskLevel(score);
+
+  const majorWarnings = allFindings.filter((f) => f.severity === 'high' || f.severity === 'critical');
+  const cautionSignals = allFindings.filter((f) => f.severity === 'caution' || f.severity === 'low');
+  const positiveSignals = allPositives;
+  const verificationGaps = allGaps.map((g) => ({ item: g }));
+
+  const summary = buildSummary(score, riskLevel, majorWarnings, cautionSignals);
+  const recommendedAction = buildRecommendedAction(allFindings);
+  const opportunityQuality = assessOpportunityQuality(input);
+
+  const categoryResults: CategoryResult[] = categories.map((c) => ({
+    name: c.category,
+    status: c.status,
+    confidence: c.confidence,
+    riskLevel: c.riskLevel,
+    evidence: [
+      ...c.findings.map((f) => f.title),
+      ...c.positives.map((f) => f.title),
+    ].slice(0, 5),
+  }));
+
+  return {
+    id: `check-${Date.now()}`,
+    riskScore: score,
+    riskLevel,
+    summary,
+    majorWarnings,
+    cautionSignals,
+    positiveSignals,
+    verificationGaps,
+    categories: categoryResults,
+    opportunityQuality,
+    recommendedAction,
+    createdAt: new Date().toISOString(),
+    inputSummary: {
+      company: input.company.trim() || undefined,
+      recruiterName: input.recruiterName.trim() || undefined,
+      jobTitle: input.jobTitle.trim() || undefined,
+    },
+  };
+}
