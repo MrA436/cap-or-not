@@ -35,10 +35,16 @@ function cleanDomain(raw: string): string | null {
 export async function lookupDomainAge(rawDomain: string): Promise<DomainAgeResult> {
   const domain = cleanDomain(rawDomain);
   const unableToVerify: DomainAgeResult = { status: 'unable_to_verify', ageDays: null, registeredDate: null };
-  if (!domain) return unableToVerify;
+  if (!domain) {
+    console.warn('[rdap] no domain after cleaning, raw input was:', JSON.stringify(rawDomain));
+    return unableToVerify;
+  }
 
   const cached = cache.get(domain);
-  if (cached && cached.expires > Date.now()) return cached.result;
+  if (cached && cached.expires > Date.now()) {
+    console.log('[rdap] cache hit for', domain, cached.result);
+    return cached.result;
+  }
 
   const remember = (result: DomainAgeResult) => {
     cache.set(domain, { result, expires: Date.now() + CACHE_TTL_MS });
@@ -49,29 +55,42 @@ export async function lookupDomainAge(rawDomain: string): Promise<DomainAgeResul
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 5000);
 
-    const res = await fetch(`https://rdap.org/domain/${encodeURIComponent(domain)}`, {
+    const url = `https://rdap.org/domain/${encodeURIComponent(domain)}`;
+    console.log('[rdap] fetching', url);
+
+    const res = await fetch(url, {
       signal: controller.signal,
       headers: { Accept: 'application/rdap+json' },
     });
     clearTimeout(timeoutId);
 
-    if (!res.ok) return remember(unableToVerify);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.warn('[rdap] non-ok response for', domain, 'status:', res.status, 'body:', body.slice(0, 300));
+      return remember(unableToVerify);
+    }
 
     const data = await res.json();
     const events: Array<{ eventAction?: string; eventDate?: string }> = Array.isArray(data?.events) ? data.events : [];
     const registration = events.find((e) => e.eventAction === 'registration');
 
-    if (!registration?.eventDate) return remember(unableToVerify);
+    if (!registration?.eventDate) {
+      console.warn('[rdap] no registration event found for', domain, 'events were:', JSON.stringify(events));
+      return remember(unableToVerify);
+    }
 
     const registeredMs = new Date(registration.eventDate).getTime();
-    if (Number.isNaN(registeredMs)) return remember(unableToVerify);
+    if (Number.isNaN(registeredMs)) {
+      console.warn('[rdap] unparseable eventDate for', domain, ':', registration.eventDate);
+      return remember(unableToVerify);
+    }
 
     const ageDays = Math.max(0, Math.floor((Date.now() - registeredMs) / (1000 * 60 * 60 * 24)));
+    console.log('[rdap] success for', domain, '- age days:', ageDays);
 
     return remember({ status: 'known', ageDays, registeredDate: registration.eventDate });
-  } catch {
-    // Network error, timeout, malformed JSON, etc. — treat as unknown,
-    // never as a warning sign.
+  } catch (err) {
+    console.error('[rdap] threw for', domain, ':', err instanceof Error ? err.message : err);
     return unableToVerify;
   }
 }
