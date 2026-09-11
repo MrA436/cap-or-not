@@ -68,7 +68,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       agreeToTerms: Boolean(input.agreeToTerms),
     };
 
-    const fullResult = analyzeOpportunity(safeInput);
+    const fullResult = await analyzeOpportunity(safeInput);
     res.status(200).json({ fullResult });
   } catch (err) {
     console.error('unlock error', err);

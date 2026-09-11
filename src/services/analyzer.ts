@@ -7,6 +7,7 @@ import type {
   OpportunityQuality,
   PublicAnalysisResult,
 } from '../types/analysis.js';
+import { lookupDomainAge } from './rdap.js';
 
 function getDomainFromUrl(url: string): string | null {
   try {
@@ -1137,11 +1138,80 @@ export function toPublicResult(result: AnalysisResult): PublicAnalysisResult {
   };
 }
 
-export function analyzeOpportunity(input: OpportunityInput): AnalysisResult {
+/**
+ * Runs the RDAP lookup for the company's website domain and folds the
+ * result into the already-computed Company Verification category. Kept
+ * as a separate async step (rather than making analyzeCompany itself
+ * async) so the RDAP network call is the only async piece in the whole
+ * analyzer — everything else stays fast, synchronous, and independently
+ * testable.
+ */
+async function applyDomainAgeSignal(input: OpportunityInput, companyCategory: CategoryAnalysis): Promise<void> {
+  if (!input.companyWebsite.trim()) return;
+  const domain = getDomainFromUrl(input.companyWebsite);
+  if (!domain) return;
+
+  const result = await lookupDomainAge(domain);
+
+  if (result.status === 'unable_to_verify') {
+    companyCategory.gaps.push('Domain registration date');
+    return;
+  }
+
+  const { ageDays } = result;
+  if (ageDays === null) return;
+
+  if (ageDays < 30) {
+    companyCategory.findings.push({
+      id: nextId(),
+      category: 'company',
+      severity: 'high',
+      title: `Website domain "${domain}" was registered ${ageDays} day${ageDays !== 1 ? 's' : ''} ago`,
+      finding: `The website domain was registered very recently (${ageDays} day${ageDays !== 1 ? 's' : ''} ago).`,
+      evidence: `Domain age: ${ageDays} days (registered ${result.registeredDate})`,
+      explanation: 'This increases uncertainty and should be verified alongside other signals. A new legitimate business can have a new domain — this alone is not proof of anything.',
+      action: 'Independently verify the company through other channels before proceeding.',
+    });
+    companyCategory.scoreContribution += 18;
+  } else if (ageDays < 180) {
+    companyCategory.findings.push({
+      id: nextId(),
+      category: 'company',
+      severity: 'caution',
+      title: `Website domain "${domain}" is ${ageDays} days old`,
+      finding: `The website domain was registered ${ageDays} days ago.`,
+      evidence: `Domain age: ${ageDays} days (registered ${result.registeredDate})`,
+      explanation: 'A newer domain is not evidence of fraud on its own, but it is a mild signal worth weighing alongside everything else.',
+      action: 'Cross-check the company through other independent sources.',
+    });
+    companyCategory.scoreContribution += 8;
+  } else if (ageDays > 365) {
+    companyCategory.positives.push({
+      id: nextId(),
+      category: 'company',
+      severity: 'positive',
+      title: `Website domain has been registered for over a year`,
+      finding: `The website domain was registered ${Math.floor(ageDays / 365)}+ year(s) ago.`,
+      evidence: `Domain age: ${ageDays} days (registered ${result.registeredDate})`,
+      explanation: 'An established domain age is a mild positive signal, though still not independent proof of legitimacy.',
+      action: 'Continue verifying other details as normal.',
+    });
+  }
+  // 180-365 days: neutral, no finding either way — matches the checklist's
+  // explicit "180+ days -> no domain-age warning" rule without overclaiming
+  // a positive for a domain that's merely not brand-new.
+
+  companyCategory.riskLevel = companyCategory.scoreContribution > 15 ? 'high' : companyCategory.scoreContribution > 5 ? 'caution' : 'low';
+}
+
+export async function analyzeOpportunity(input: OpportunityInput): Promise<AnalysisResult> {
   findingCounter = 0;
 
+  const companyCategory = analyzeCompany(input);
+  await applyDomainAgeSignal(input, companyCategory);
+
   const categories: CategoryAnalysis[] = [
-    analyzeCompany(input),
+    companyCategory,
     analyzeRecruiterIdentity(input),
     analyzeEmailDomain(input),
     analyzeJobPosting(input),

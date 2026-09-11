@@ -10,5 +10,5 @@
     "resolveJsonModule": true,
     "types": ["node"]
   },
-  "include": ["api/**/*.ts", "src/types/analysis.ts", "src/services/analyzer.ts"]
+  "include": ["api/**/*.ts", "src/types/analysis.ts", "src/services/analyzer.ts", "src/services/rdap.ts"]
 }

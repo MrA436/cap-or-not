@@ -48,7 +48,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
 
-    const fullResult = analyzeOpportunity(safeInput);
+    const fullResult = await analyzeOpportunity(safeInput);
     const publicResult = toPublicResult(fullResult);
 
     res.status(200).json({ publicResult });
