@@ -151,22 +151,14 @@ function analyzeCompany(input: OpportunityInput): CategoryAnalysis {
     return {
       category: 'Company Verification',
       status: 'unable', confidence: 'none', riskLevel: 'low',
-      findings, positives, gaps, scoreContribution: 5,
+      findings, positives, gaps, scoreContribution: 0,
     };
   }
 
   if (!input.companyWebsite.trim()) {
-    findings.push({
-      id: nextId(),
-      category: 'company',
-      severity: 'caution',
-      title: `No website provided for "${input.company}"`,
-      finding: `No official website was supplied for ${input.company}.`,
-      evidence: input.company,
-      explanation: 'A legitimate company typically has an official website that can be independently verified.',
-      action: 'Search for the company\'s official website independently and verify it matches the claimed company.',
-    });
-    scoreContribution += 10;
+    // No website is missing information, not evidence of anything — this
+    // is a verification gap, not a red flag. It doesn't score.
+    gaps.push(`Whether "${input.company}" has a verifiable official website`);
     gaps.push('Whether the company exists');
     gaps.push('Whether the opportunity is consistent with the company');
   }
@@ -318,20 +310,10 @@ function analyzeRecruiterIdentity(input: OpportunityInput): CategoryAnalysis {
       });
     }
 
-    const msgWords = input.recruiterMessage.trim().split(/\s+/);
-    if (msgWords.length < 20 && msgWords.length > 0) {
-      findings.push({
-        id: nextId(),
-        category: 'recruiter',
-        severity: 'low',
-        title: 'Very short recruiter message',
-        finding: 'The recruiter message is unusually brief.',
-        evidence: `${msgWords.length} words`,
-        explanation: 'Very short messages may indicate mass outreach or lack of personalization.',
-        action: 'Ask for more details about the role and company.',
-      });
-      scoreContribution += 3;
-    }
+    // Brevity alone is not a red flag — removed as a scored finding.
+    // A short message isn't evidence of mass outreach any more than a
+    // long one is evidence of legitimacy. If this needs re-adding later,
+    // it should only fire in combination with other signals, never alone.
 
     if (!input.recruiterName.trim() && input.recruiterMessage.trim()) {
       findings.push({
@@ -371,7 +353,7 @@ function analyzeEmailDomain(input: OpportunityInput): CategoryAnalysis {
     return {
       category: 'Email / Domain Analysis',
       status: 'unable', confidence: 'none', riskLevel: 'low',
-      findings, positives, gaps, scoreContribution: 3,
+      findings, positives, gaps, scoreContribution: 0,
     };
   }
 
@@ -487,7 +469,7 @@ function analyzeJobPosting(input: OpportunityInput): CategoryAnalysis {
     return {
       category: 'Job Posting Analysis',
       status: 'unable', confidence: 'none', riskLevel: 'low',
-      findings, positives, gaps, scoreContribution: 5,
+      findings, positives, gaps, scoreContribution: 0,
     };
   }
 
@@ -506,29 +488,23 @@ function analyzeJobPosting(input: OpportunityInput): CategoryAnalysis {
     scoreContribution += scamHits.length > 2 ? 15 : 8;
   }
 
-  if (input.description.trim()) {
-    const words = input.description.trim().split(/\s+/);
-    if (words.length < 30) {
-      findings.push({
-        id: nextId(),
-        category: 'job',
-        severity: 'caution',
-        title: 'Job description is very short',
-        finding: 'The job description is unusually brief.',
-        evidence: `${words.length} words`,
-        explanation: 'Vague or extremely short descriptions make it hard to assess the legitimacy of the role.',
-        action: 'Ask for a detailed job description with specific responsibilities and requirements.',
-      });
-      scoreContribution += 5;
+  const combinedWordCount = text.trim() ? text.trim().split(/\s+/).length : 0;
+  if (combinedWordCount > 0) {
+    if (combinedWordCount < 30) {
+      // A brief submission isn't a red flag — it's insufficient
+      // information to assess the role, which belongs in gaps, not
+      // findings. Don't penalize the score for something the person
+      // simply didn't have to paste in.
+      gaps.push('Whether enough detail was provided to assess the role');
     } else {
       positives.push({
         id: nextId(),
         category: 'job',
         severity: 'positive',
-        title: 'Detailed job description provided',
-        finding: 'The job description has enough detail to assess the role.',
-        evidence: `${words.length} words`,
-        explanation: 'A detailed description allows for better assessment of the opportunity.',
+        title: 'Enough detail provided to assess the role',
+        finding: 'Enough information was provided to meaningfully assess the opportunity.',
+        evidence: `${combinedWordCount} words`,
+        explanation: 'More detail allows for a better assessment of the opportunity.',
         action: 'Verify the details against the company\'s official careers page.',
       });
     }
@@ -658,7 +634,7 @@ function analyzeRecruitmentProcess(input: OpportunityInput): CategoryAnalysis {
     return {
       category: 'Recruitment Process',
       status: 'unable', confidence: 'none', riskLevel: 'low',
-      findings, positives, gaps, scoreContribution: 3,
+      findings, positives, gaps, scoreContribution: 0,
     };
   }
 
@@ -999,7 +975,7 @@ function assessOpportunityQuality(input: OpportunityInput): OpportunityQuality {
 
   let qualityScore = 0;
 
-  if (input.description.trim().length < 50) {
+  if (text.trim().length < 50) {
     notes.push('Job description is very brief — unclear responsibilities.');
     qualityScore -= 1;
   } else {
