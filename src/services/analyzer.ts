@@ -25,6 +25,45 @@ function getDomainFromEmail(email: string): string | null {
   return match ? match[1] : null;
 }
 
+const COMMON_NON_COMPANY_WORDS = new Set([
+  'we', 'our', 'the', 'this', 'you', 'your', 'about', 'role', 'job',
+  'position', 'team', 'company', 'apply', 'work', 'i', 'a', 'an',
+]);
+
+/**
+ * Best-effort company name extraction from unstructured pasted text or a
+ * website domain, used only when the person didn't type a company name
+ * themselves. This is regex/heuristic-based, not real NLP — it exists so
+ * an obviously-named company (e.g. "Parsewave creates high-quality...")
+ * doesn't get reported as a verification gap when the name is sitting
+ * right there in the text. Returns null rather than guessing wrong; a
+ * missed extraction just falls back to the honest "not provided" gap.
+ */
+function inferCompanyName(text: string): string | null {
+  const patterns = [
+    /\babout\s+(?:the\s+job\s*[\r\n]+)?([A-Z][A-Za-z0-9&.,'-]{1,40}?)\s+(?:creates|is|builds|provides|offers|helps|was founded|specializes|develops)\b/i,
+    /\bjoin\s+([A-Z][A-Za-z0-9&.,'-]{1,40}?)(?:[.,!]|\s+as\s+|\s+to\s+)/,
+    /^([A-Z][A-Za-z0-9&.,'-]{1,40}?)\s+is\s+(?:a|an|looking for|hiring|seeking)\b/m,
+    /\bat\s+([A-Z][A-Za-z0-9&.,'-]{1,40}?)[.,!\n]/,
+  ];
+  for (const p of patterns) {
+    const m = text.match(p);
+    const candidate = m?.[1]?.trim();
+    if (candidate && candidate.length > 1 && !COMMON_NON_COMPANY_WORDS.has(candidate.toLowerCase())) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function inferCompanyNameFromWebsite(website: string): string | null {
+  const domain = getDomainFromUrl(website);
+  if (!domain) return null;
+  const label = domain.split('.')[0];
+  if (!label || label.length < 2) return null;
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
 const FREE_EMAIL_PROVIDERS = new Set([
   'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'live.com',
   'icloud.com', 'aol.com', 'protonmail.com', 'mail.com', 'yandex.com',
@@ -1284,19 +1323,41 @@ async function applyDomainAgeSignal(input: OpportunityInput, companyCategory: Ca
 export async function analyzeOpportunity(input: OpportunityInput): Promise<AnalysisResult> {
   findingCounter = 0;
 
-  const companyCategory = analyzeCompany(input);
-  await applyDomainAgeSignal(input, companyCategory);
+  let effectiveInput = input;
+  let inferredCompanyFinding: Finding | null = null;
+
+  if (!input.company.trim()) {
+    const combinedText = `${input.recruiterMessage} ${input.description} ${input.offerLetter}`;
+    const inferred = inferCompanyName(combinedText) ?? inferCompanyNameFromWebsite(input.companyWebsite);
+    if (inferred) {
+      effectiveInput = { ...input, company: inferred };
+      inferredCompanyFinding = {
+        id: nextId(),
+        category: 'company',
+        severity: 'positive',
+        title: `Company identified: "${inferred}"`,
+        finding: `A company name was not explicitly entered, but "${inferred}" was identified from the submitted text${input.companyWebsite.trim() ? ' or website' : ''}.`,
+        evidence: inferred,
+        explanation: 'This is a best-effort extraction, not a manual entry — worth double-checking it matches the actual company before relying on it.',
+        action: 'Confirm this is the correct company name.',
+      };
+    }
+  }
+
+  const companyCategory = analyzeCompany(effectiveInput);
+  if (inferredCompanyFinding) companyCategory.positives.push(inferredCompanyFinding);
+  await applyDomainAgeSignal(effectiveInput, companyCategory);
 
   const categories: CategoryAnalysis[] = [
     companyCategory,
-    analyzeRecruiterIdentity(input),
-    analyzeEmailDomain(input),
-    analyzeJobPosting(input),
-    analyzePayment(`${input.offerLetter} ${input.recruiterMessage} ${input.description}`),
-    analyzeRecruitmentProcess(input),
-    analyzeBrandImpersonation(input),
-    analyzeOfferLetter(input),
-    analyzeSensitiveInfo(input),
+    analyzeRecruiterIdentity(effectiveInput),
+    analyzeEmailDomain(effectiveInput),
+    analyzeJobPosting(effectiveInput),
+    analyzePayment(`${effectiveInput.offerLetter} ${effectiveInput.recruiterMessage} ${effectiveInput.description}`),
+    analyzeRecruitmentProcess(effectiveInput),
+    analyzeBrandImpersonation(effectiveInput),
+    analyzeOfferLetter(effectiveInput),
+    analyzeSensitiveInfo(effectiveInput),
   ];
 
   const allFindings = categories.flatMap((c) => c.findings);
@@ -1314,7 +1375,7 @@ export async function analyzeOpportunity(input: OpportunityInput): Promise<Analy
 
   const summary = buildSummary(score, riskLevel, majorWarnings, cautionSignals);
   const recommendedAction = buildRecommendedAction(allFindings);
-  const opportunityQuality = assessOpportunityQuality(input);
+  const opportunityQuality = assessOpportunityQuality(effectiveInput);
   const verificationConfidence = computeVerificationConfidence(categories);
 
   const categoryResults: CategoryResult[] = categories.map((c) => ({
@@ -1343,9 +1404,9 @@ export async function analyzeOpportunity(input: OpportunityInput): Promise<Analy
     recommendedAction,
     createdAt: new Date().toISOString(),
     inputSummary: {
-      company: input.company.trim() || undefined,
-      recruiterName: input.recruiterName.trim() || undefined,
-      jobTitle: input.jobTitle.trim() || undefined,
+      company: effectiveInput.company.trim() || undefined,
+      recruiterName: effectiveInput.recruiterName.trim() || undefined,
+      jobTitle: effectiveInput.jobTitle.trim() || undefined,
     },
   };
 }

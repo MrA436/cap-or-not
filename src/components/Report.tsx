@@ -273,7 +273,7 @@ export default function Report({ publicResult, fullResult, input, onUnlocked }: 
 
       <section className={`rounded-lg border ${qualityStyle.border} ${qualityStyle.bg} p-5 flex items-center justify-between gap-3`}>
         <div>
-          <p className="text-sm font-semibold text-gray-900 mb-1">Opportunity quality</p>
+          <p className="text-sm font-semibold text-gray-900 mb-1">Verification Completeness</p>
           <span className={`inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white ${qualityStyle.color} text-sm font-semibold`}>
             {publicResult.qualityRating}
           </span>
@@ -293,7 +293,7 @@ export default function Report({ publicResult, fullResult, input, onUnlocked }: 
           {publicResult.recommendedActionHasMore && <span className="text-gray-500">…</span>}
         </p>
         {publicResult.actionStepsCount > 0 && (
-          <p className="text-xs text-gray-500 mt-3">See the full {publicResult.actionStepsCount}-step action plan in the unlocked report</p>
+          <p className="text-xs text-gray-500 mt-3">Unlock the full verification: evidence, category checks, and your recommended next step.</p>
         )}
       </section>
 
