@@ -1,10 +1,9 @@
-import type { AnalysisResult, PublicAnalysisResult, PublicFinding, OpportunityInput } from '@/types/analysis';
+import type { AnalysisResult, PublicAnalysisResult, PublicFinding, OpportunityInput, Finding } from '@/types/analysis';
 import RiskScore from './RiskScore';
 import FindingCard from './FindingCard';
-import VerificationStatus from './VerificationStatus';
 import OpportunityQualityCard from './OpportunityQualityCard';
 import UnlockGate from './UnlockGate';
-import { AlertTriangle, AlertCircle, CheckCircle2, Search, Copy, Share2, Clock, Lock } from 'lucide-react';
+import { AlertTriangle, AlertCircle, CheckCircle2, Search, Copy, Share2, Clock, Lock, ShieldCheck } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import { generateShareSummary, generateFullReport, copyToClipboard } from '@/services/share';
 
@@ -20,6 +19,37 @@ const qualityRatingStyle: Record<string, { color: string; bg: string; border: st
   'Limited Information': { color: 'text-amber-600', bg: 'bg-amber-50', border: 'border-amber-200' },
   'Potentially Low Quality': { color: 'text-orange-600', bg: 'bg-orange-50', border: 'border-orange-200' },
 };
+
+const confidenceStyle: Record<string, string> = {
+  High: 'text-emerald-600',
+  Medium: 'text-amber-600',
+  Low: 'text-gray-500',
+};
+
+// Findings are grouped by SUBJECT for the unlocked report (Company, then
+// Recruiter, then Job/Internship, then Claims) rather than by severity —
+// this reads like an actual audit ("here's everything about the
+// recruiter") instead of a flat list sorted by how scary each item is.
+const SUBJECT_GROUPS: { label: string; categories: string[] }[] = [
+  { label: 'Company Verification', categories: ['company'] },
+  { label: 'Recruiter Verification', categories: ['recruiter', 'email'] },
+  { label: 'Job / Internship Analysis', categories: ['job', 'payment', 'process', 'offer', 'sensitive'] },
+  { label: 'Claim Verification', categories: ['brand'] },
+];
+
+const severityRank: Record<string, number> = { critical: 0, high: 1, caution: 2, low: 3, positive: 4 };
+
+function groupFindingsBySubject(fullResult: AnalysisResult): { label: string; findings: Finding[] }[] {
+  const all = [...fullResult.majorWarnings, ...fullResult.cautionSignals, ...fullResult.positiveSignals];
+  return SUBJECT_GROUPS
+    .map((group) => ({
+      label: group.label,
+      findings: all
+        .filter((f) => group.categories.includes(f.category))
+        .sort((a, b) => severityRank[a.severity] - severityRank[b.severity]),
+    }))
+    .filter((g) => g.findings.length > 0);
+}
 
 function LockedFindingRow({ finding }: { finding: PublicFinding }) {
   const dot = finding.severity === 'critical' || finding.severity === 'high' ? 'bg-red-500' : 'bg-orange-400';
@@ -69,55 +99,41 @@ export default function Report({ publicResult, fullResult, input, onUnlocked }: 
 
   const gatedContent = fullResult && (
     <div className="space-y-6">
-      <section className="bg-white rounded-xl border border-gray-200 shadow-sm p-5">
-        <h3 className="flex items-center gap-2 text-lg font-bold text-gray-900 mb-1">
-          <Search className="w-5 h-5 text-gray-400" />
-          Full category breakdown
-        </h3>
-        <p className="text-sm text-gray-500 mb-4">How each verification area was assessed.</p>
-        <div className="space-y-1">
-          {fullResult.categories.map((cat) => (
-            <VerificationStatus key={cat.name} category={cat} />
-          ))}
-        </div>
-      </section>
-
-      {(fullResult.majorWarnings.length > 0 || fullResult.cautionSignals.length > 0) && (
-        <section>
+      {groupFindingsBySubject(fullResult).map((group) => (
+        <section key={group.label}>
           <h3 className="flex items-center gap-2 text-lg font-bold text-gray-900 mb-3">
-            <Lock className="w-4 h-4 text-gray-400" />
-            Every finding, in full
+            <Search className="w-4 h-4 text-gray-400" />
+            {group.label}
           </h3>
           <div className="space-y-3">
-            {fullResult.majorWarnings.map((f) => (
-              <FindingCard key={f.id} finding={f} defaultExpanded />
-            ))}
-            {fullResult.cautionSignals.map((f) => (
-              <FindingCard key={f.id} finding={f} />
+            {group.findings.map((f) => (
+              <FindingCard key={f.id} finding={f} defaultExpanded={f.severity === 'critical' || f.severity === 'high'} />
             ))}
           </div>
         </section>
-      )}
-
-      {fullResult.positiveSignals.length > 0 && (
-        <section>
-          <h3 className="flex items-center gap-2 text-lg font-bold text-gray-900 mb-3">
-            <span className="w-3 h-3 rounded-full bg-emerald-500" />
-            No cap, this checks out
-          </h3>
-          <div className="space-y-3">
-            {fullResult.positiveSignals.map((f) => (
-              <FindingCard key={f.id} finding={f} />
-            ))}
-          </div>
-        </section>
-      )}
+      ))}
 
       <OpportunityQualityCard quality={fullResult.opportunityQuality} />
 
-      <section className="bg-gray-900 rounded-xl p-6 text-center">
-        <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-3">Recommended action</h3>
-        <p className="text-lg text-white font-medium leading-relaxed max-w-xl mx-auto">{fullResult.recommendedAction}</p>
+      <section className="bg-gray-900 rounded-xl p-6">
+        <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-4 text-center flex items-center justify-center gap-2">
+          <ShieldCheck className="w-4 h-4" />
+          What you should do
+        </h3>
+        <ol className="space-y-3 max-w-xl mx-auto">
+          {fullResult.recommendedAction.steps.map((step, i) => (
+            <li key={i} className="flex items-start gap-3 text-white text-sm">
+              <span className="flex-shrink-0 w-5 h-5 rounded-full bg-white/15 text-xs font-semibold flex items-center justify-center mt-0.5">
+                {i + 1}
+              </span>
+              <span className="leading-relaxed">{step}</span>
+            </li>
+          ))}
+        </ol>
+        <div className="mt-5 pt-5 border-t border-white/10 text-center">
+          <p className="text-xs text-gray-500 uppercase tracking-wide mb-1.5">Bottom line</p>
+          <p className="text-white font-medium leading-relaxed max-w-xl mx-auto">{fullResult.recommendedAction.bottomLine}</p>
+        </div>
       </section>
 
       <div className="flex flex-col sm:flex-row gap-3">
@@ -147,7 +163,10 @@ export default function Report({ publicResult, fullResult, input, onUnlocked }: 
             <HeaderIcon className="w-6 h-6" />
           </div>
           <RiskScore score={animateScore ? publicResult.riskScore : 0} level={publicResult.riskLevel} size="lg" />
-          <p className="mt-4 text-gray-600 max-w-lg mx-auto text-sm">{publicResult.summary}</p>
+          <p className={`mt-2 text-xs font-semibold ${confidenceStyle[publicResult.verificationConfidence]}`}>
+            Verification confidence: {publicResult.verificationConfidence}
+          </p>
+          <p className="mt-3 text-gray-600 max-w-lg mx-auto text-sm">{publicResult.summary}</p>
         </div>
 
         <div className="grid grid-cols-2 sm:grid-cols-4 border-t border-gray-100">
@@ -226,7 +245,7 @@ export default function Report({ publicResult, fullResult, input, onUnlocked }: 
         <section className="bg-amber-50 rounded-xl border border-amber-200 p-5">
           <h3 className="flex items-center gap-2 text-lg font-bold text-gray-900 mb-1">
             <Search className="w-5 h-5 text-amber-500" />
-            {publicResult.verificationGaps.length} important claim{publicResult.verificationGaps.length !== 1 ? 's' : ''} in this offer could not be independently verified
+            {publicResult.verificationGaps.length} verification check{publicResult.verificationGaps.length !== 1 ? 's' : ''} could not be completed with the information provided
           </h3>
           <ul className="space-y-2 mt-3">
             {publicResult.verificationGaps.map((gap, i) => (
@@ -268,11 +287,14 @@ export default function Report({ publicResult, fullResult, input, onUnlocked }: 
       </section>
 
       <section className="bg-gray-900 rounded-xl p-6 text-center">
-        <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-3">Recommended action</h3>
+        <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-3">Bottom line</h3>
         <p className="text-lg text-white font-medium leading-relaxed max-w-xl mx-auto">
           {publicResult.recommendedActionPreview}
-          {publicResult.recommendedActionHasMore && <span className="text-gray-500">… unlock to see the full guidance</span>}
+          {publicResult.recommendedActionHasMore && <span className="text-gray-500">…</span>}
         </p>
+        {publicResult.actionStepsCount > 0 && (
+          <p className="text-xs text-gray-500 mt-3">See the full {publicResult.actionStepsCount}-step action plan in the unlocked report</p>
+        )}
       </section>
 
       {unlocked ? gatedContent : <UnlockGate input={input} onUnlocked={onUnlocked} />}

@@ -6,6 +6,8 @@ import type {
   RiskLevel,
   OpportunityQuality,
   PublicAnalysisResult,
+  VerificationConfidence,
+  RecommendedActionPlan,
 } from '../types/analysis.js';
 import { lookupDomainAge } from './rdap.js';
 
@@ -32,17 +34,34 @@ const FREE_EMAIL_PROVIDERS = new Set([
 const MESSAGING_PLATFORMS = ['whatsapp', 'telegram', 'signal', 'discord', 'wechat'];
 const JOB_PLATFORMS = ['linkedin', 'indeed', 'glassdoor', 'naukri', 'internshala', 'monster', 'angel.co', 'wellfound'];
 
-const PAYMENT_KEYWORDS = [
+// Phrases that inherently describe the applicant being asked to pay the
+// company — these are safe to flag on their own.
+const PAYMENT_DEMAND_KEYWORDS = [
   'registration fee', 'application fee', 'security deposit', 'training fee',
   'training cost', 'certification fee', 'certificate fee', 'laptop deposit',
   'equipment deposit', 'equipment fee', 'refundable deposit', 'onboarding fee',
   'onboarding charge', 'interview fee', 'registration charge', 'processing fee',
-  'security money', 'deposit', 'advance payment', 'upfront payment', 'fee of',
+  'security money', 'advance payment', 'upfront payment',
   'pay ₹', 'pay rs', 'pay $', 'transfer funds', 'wire transfer', 'bank transfer',
-  'gift card', 'amazon gift', 'itunes gift', 'google play gift', 'bitcoin',
-  'cryptocurrency', 'crypto payment', 'usdt', 'ether', 'wire money', 'send money',
-  'registration amount', 'fee for', 'payment required', 'pay for',
-  'training charges', 'course fee', 'course fee',
+  'gift card', 'amazon gift', 'itunes gift', 'google play gift',
+  'wire money', 'send money', 'registration amount', 'payment required',
+  'training charges', 'course fee',
+];
+
+// Crypto terms are only meaningful as a red flag when paired with an
+// actual payment-demand verb nearby — a bare mention of "ether" or
+// "crypto" isn't evidence of anything asked of the applicant.
+const CRYPTO_TERMS = ['bitcoin', 'cryptocurrency', 'crypto payment', 'usdt', 'ether', 'eth wallet'];
+const PAYMENT_DEMAND_VERBS = ['pay', 'payment', 'send', 'transfer', 'deposit', 'wire'];
+
+// If these appear in the same sentence as a dollar amount, that amount is
+// compensation being offered TO the applicant, not a payment being
+// demanded FROM them — the opposite of a red flag.
+const COMPENSATION_CONTEXT_PATTERNS = [
+  'per month', '/month', 'per week', '/week', 'per hour', '/hour', 'per day',
+  'salary', 'compensation', 'stipend', 'paid trial', 'you will be paid',
+  'you will receive', 'we pay', 'earned by', 'monthly pay', 'take-home',
+  'base pay', 'pay range', 'above market', 'market average', 'earn up to',
 ];
 
 const PRESSURE_KEYWORDS = [
@@ -91,8 +110,16 @@ function nextId(): string {
 }
 
 function containsAny(text: string, keywords: string[]): string[] {
-  const lower = text.toLowerCase();
-  return keywords.filter((k) => lower.includes(k));
+  // Word-boundary matching, not raw substring containment. Substring
+  // matching was causing real false positives — e.g. the keyword "ether"
+  // (crypto slang) matching inside the ordinary word "whether", since
+  // "whether".includes("ether") is true. \b correctly rejects that while
+  // still matching "ether" as its own word, and works the same way for
+  // multi-word phrases like "registration fee".
+  return keywords.filter((k) => {
+    const escaped = k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`\\b${escaped}\\b`, 'i').test(text);
+  });
 }
 
 function detectLookalikeDomain(emailDomain: string, companyDomain: string): boolean {
@@ -316,17 +343,10 @@ function analyzeRecruiterIdentity(input: OpportunityInput): CategoryAnalysis {
     // it should only fire in combination with other signals, never alone.
 
     if (!input.recruiterName.trim() && input.recruiterMessage.trim()) {
-      findings.push({
-        id: nextId(),
-        category: 'recruiter',
-        severity: 'caution',
-        title: 'No recruiter name provided',
-        finding: 'The recruiter message does not include an identifiable recruiter name.',
-        evidence: 'No name in recruiter message field',
-        explanation: 'Anonymous recruitment is harder to verify and is a mild risk indicator.',
-        action: 'Ask the recruiter for their full name, title, and company email address.',
-      });
-      scoreContribution += 5;
+      // Not a red flag on its own — a scraped job posting or formal
+      // listing naturally has no personal "recruiter name" the way a
+      // DM-style message might. Already captured as a gap above; no
+      // separate finding or duplicate gap needed here.
     }
   }
 
@@ -568,7 +588,44 @@ function analyzePayment(text: string): CategoryAnalysis {
     };
   }
 
-  const paymentHits = containsAny(text, PAYMENT_KEYWORDS);
+  // Full amount token, including "k"/lakh/crore suffixes and comma
+  // grouping — the previous regex truncated "$5k" down to "$5".
+  const AMOUNT_REGEX = /(?:₹|\$|€|£|Rs\.?|INR)\s?\d{1,3}(?:,\d{2,3})*(?:\.\d+)?\s?(?:k|K|lakh|lakhs|crore|crores)?(?:\s?\/\s?(?:month|mo|week|wk|hour|hr|day))?/g;
+
+  // Sentence-level analysis so a dollar amount is only ever treated as a
+  // "payment requested from you" red flag when it actually appears in a
+  // sentence that's demanding payment — not anywhere compensation is
+  // mentioned. This is what fixes "$5k/month earned by top contributors"
+  // being misread as a payment request.
+  const sentences = text.split(/(?<=[.!?\n])\s+/).filter((s) => s.trim());
+
+  const demandHitsAll = new Set<string>();
+  const flaggedAmounts: string[] = [];
+  let compensationAmountFound = false;
+
+  for (const sentence of sentences) {
+    const demandHits = containsAny(sentence, PAYMENT_DEMAND_KEYWORDS);
+    const cryptoHits = containsAny(sentence, CRYPTO_TERMS);
+    const hasDemandVerb = containsAny(sentence, PAYMENT_DEMAND_VERBS).length > 0;
+    // A crypto term only counts as a demand if it's paired with an actual
+    // payment verb in the same sentence — "ether" or "crypto" mentioned
+    // on its own isn't evidence anyone is being asked to pay anything.
+    const effectiveCryptoHits = hasDemandVerb ? cryptoHits : [];
+
+    const allDemandHits = [...demandHits, ...effectiveCryptoHits];
+    const isCompensationSentence = containsAny(sentence, COMPENSATION_CONTEXT_PATTERNS).length > 0;
+    const amountsInSentence = sentence.match(AMOUNT_REGEX);
+
+    if (allDemandHits.length > 0) {
+      allDemandHits.forEach((h) => demandHitsAll.add(h));
+      if (amountsInSentence) flaggedAmounts.push(...amountsInSentence);
+    } else if (amountsInSentence && isCompensationSentence) {
+      compensationAmountFound = true;
+    }
+  }
+
+  const paymentHits = Array.from(demandHitsAll);
+
   if (paymentHits.length > 0) {
     findings.push({
       id: nextId(),
@@ -581,21 +638,31 @@ function analyzePayment(text: string): CategoryAnalysis {
       action: 'Do not pay until you have independently verified the opportunity through official company channels.',
     });
     scoreContribution += 30;
-  }
 
-  const amountMatch = text.match(/[₹$€£]\s*[\d,]+/g);
-  if (amountMatch && paymentHits.length > 0) {
-    findings.push({
+    if (flaggedAmounts.length > 0) {
+      findings.push({
+        id: nextId(),
+        category: 'payment',
+        severity: 'high',
+        title: `Specific amount requested: ${flaggedAmounts[0]}`,
+        finding: `A specific amount (${flaggedAmounts.slice(0, 3).join(', ')}) is mentioned alongside payment-request language.`,
+        evidence: flaggedAmounts.slice(0, 3).join(', '),
+        explanation: 'Requests for specific upfront amounts are a hallmark of advance-fee fraud.',
+        action: 'Do not transfer any money. Verify the opportunity independently first.',
+      });
+      scoreContribution += 10;
+    }
+  } else if (compensationAmountFound) {
+    positives.push({
       id: nextId(),
       category: 'payment',
-      severity: 'high',
-      title: `Specific amount requested: ${amountMatch[0]}`,
-      finding: `A specific amount (${amountMatch.slice(0, 3).join(', ')}) is mentioned alongside payment-related language.`,
-      evidence: amountMatch.slice(0, 3).join(', '),
-      explanation: 'Requests for specific upfront amounts are a hallmark of advance-fee fraud.',
-      action: 'Do not transfer any money. Verify the opportunity independently first.',
+      severity: 'positive',
+      title: 'Compensation details provided, no payment requested',
+      finding: 'A specific compensation amount is mentioned, and no payment is requested from the applicant.',
+      evidence: 'Amount appears alongside compensation language (e.g. "per month", "salary"), not payment-demand language',
+      explanation: 'Money described as being paid to the applicant is the opposite of a red flag — this only becomes a concern if a separate, genuine payment request also appears elsewhere.',
+      action: 'Independently verify the compensation is realistic for the role and market.',
     });
-    scoreContribution += 10;
   }
 
   if (paymentHits.length === 0 && text.trim().length > 50) {
@@ -887,7 +954,7 @@ function analyzeOfferLetter(input: OpportunityInput): CategoryAnalysis {
     scoreContribution += 8;
   }
 
-  const paymentHits = containsAny(text, PAYMENT_KEYWORDS);
+  const paymentHits = containsAny(text, PAYMENT_DEMAND_KEYWORDS);
   if (paymentHits.length > 0) {
     findings.push({
       id: nextId(),
@@ -985,9 +1052,16 @@ function assessOpportunityQuality(input: OpportunityInput): OpportunityQuality {
   if (lower.includes('mentor') || lower.includes('mentorship')) {
     notes.push('Mentorship is mentioned.');
     qualityScore += 1;
-  } else {
-    notes.push('No mentorship structure mentioned.');
-    qualityScore -= 1;
+  }
+  // Absence of a mentorship mention is not penalized — most legitimate
+  // postings simply don't use that specific word, and its absence isn't
+  // evidence of anything. Every qualitative conclusion here should be
+  // backed by something actually present in the text, not by a missing
+  // buzzword.
+
+  if (containsAny(text, COMPENSATION_CONTEXT_PATTERNS).length > 0) {
+    notes.push('Compensation details are clearly described.');
+    qualityScore += 1;
   }
 
   if (lower.includes('certificate') && !lower.includes('salary') && !lower.includes('stipend')) {
@@ -1033,32 +1107,57 @@ function buildSummary(score: number, level: RiskLevel, major: Finding[], caution
   return `${level} — No significant risk indicators were detected from the information provided. Continue with normal verification.`;
 }
 
-function buildRecommendedAction(findings: Finding[]): string {
+function buildRecommendedAction(findings: Finding[]): RecommendedActionPlan {
   const hasPayment = findings.some((f) => f.category === 'payment');
   const hasRecruiterIssue = findings.some((f) => f.category === 'recruiter' && (f.severity === 'high' || f.severity === 'critical'));
   const hasSensitive = findings.some((f) => f.category === 'sensitive');
   const hasEmailIssue = findings.some((f) => f.category === 'email' && (f.severity === 'high' || f.severity === 'critical'));
+  const hasBrandClaim = findings.some((f) => f.category === 'brand' && (f.severity === 'high' || f.severity === 'critical'));
   const highCount = findings.filter((f) => f.severity === 'high' || f.severity === 'critical').length;
 
-  const actions: string[] = [];
+  // One consolidated, prioritized list — not each finding repeating its
+  // own "recommended action" separately. Order matters: the most urgent,
+  // most concrete step comes first.
+  const steps: string[] = [];
 
   if (hasPayment) {
-    actions.push('Do not pay or submit sensitive documents yet.');
+    steps.push('Do not pay any requested fee, deposit, or amount.');
   }
   if (hasSensitive) {
-    actions.push('Avoid submitting identity, banking, or other sensitive information until the employer is independently verified.');
+    steps.push('Do not submit identity documents, banking details, or other sensitive information yet.');
   }
   if (hasRecruiterIssue || hasEmailIssue) {
-    actions.push('Find the company\'s official website and contact HR through independently sourced contact information.');
+    steps.push("Contact the company through its official website — not through this recruiter's contact details.");
   }
-  if (highCount === 0) {
-    actions.push('Continue normally, but verify important details through official channels before sharing sensitive information.');
+  if (hasBrandClaim) {
+    steps.push('Ask the company directly whether this recruiter or opportunity is authorized to use their name.');
   }
-  if (actions.length === 0) {
-    actions.push('Verify key details through the company\'s official website before sharing sensitive information.');
+  steps.push("Verify the role exists on the company's official careers page.");
+
+  let bottomLine: string;
+  if (hasPayment || highCount >= 2) {
+    bottomLine = 'Do not proceed until the recruiter and opportunity are independently verified.';
+  } else if (highCount === 1) {
+    bottomLine = 'Proceed with caution, and verify the flagged concern before moving forward.';
+  } else {
+    bottomLine = 'No major red flags were detected, but independent verification is still recommended before proceeding.';
   }
 
-  return actions.join(' ');
+  return { steps, bottomLine };
+}
+
+/**
+ * "Risk" and "confidence" are deliberately separate values. A report can
+ * legitimately be High Risk / Low Confidence ("we found warning signs but
+ * couldn't verify much of this") — collapsing both into one score would
+ * hide that distinction, which is exactly the "SCAM: 87%" framing the
+ * checklist explicitly rules out.
+ */
+function computeVerificationConfidence(categories: CategoryAnalysis[]): VerificationConfidence {
+  const unableCount = categories.filter((c) => c.status === 'unable').length;
+  if (unableCount <= 1) return 'High';
+  if (unableCount <= 4) return 'Medium';
+  return 'Low';
 }
 
 /**
@@ -1087,12 +1186,13 @@ export function toPublicResult(result: AnalysisResult): PublicAnalysisResult {
     ? { id: result.positiveSignals[0].id, title: result.positiveSignals[0].title, severity: result.positiveSignals[0].severity }
     : null;
 
-  const actionPreview = result.recommendedAction.slice(0, 70).trim();
+  const actionPreview = result.recommendedAction.bottomLine.slice(0, 70).trim();
 
   return {
     id: result.id,
     riskScore: result.riskScore,
     riskLevel: result.riskLevel,
+    verificationConfidence: result.verificationConfidence,
     summary: result.summary,
     previewFinding,
     lockedFindingTitles: lockedFindings.slice(0, 2).map((f) => ({ id: f.id, title: f.title, severity: f.severity })),
@@ -1108,7 +1208,8 @@ export function toPublicResult(result: AnalysisResult): PublicAnalysisResult {
     qualityRating: result.opportunityQuality.rating,
     qualityNotesLockedCount: result.opportunityQuality.notes.length,
     recommendedActionPreview: actionPreview,
-    recommendedActionHasMore: result.recommendedAction.length > actionPreview.length,
+    recommendedActionHasMore: result.recommendedAction.bottomLine.length > actionPreview.length,
+    actionStepsCount: result.recommendedAction.steps.length,
     createdAt: result.createdAt,
     inputSummary: result.inputSummary,
   };
@@ -1214,6 +1315,7 @@ export async function analyzeOpportunity(input: OpportunityInput): Promise<Analy
   const summary = buildSummary(score, riskLevel, majorWarnings, cautionSignals);
   const recommendedAction = buildRecommendedAction(allFindings);
   const opportunityQuality = assessOpportunityQuality(input);
+  const verificationConfidence = computeVerificationConfidence(categories);
 
   const categoryResults: CategoryResult[] = categories.map((c) => ({
     name: c.category,
@@ -1230,6 +1332,7 @@ export async function analyzeOpportunity(input: OpportunityInput): Promise<Analy
     id: `check-${Date.now()}`,
     riskScore: score,
     riskLevel,
+    verificationConfidence,
     summary,
     majorWarnings,
     cautionSignals,

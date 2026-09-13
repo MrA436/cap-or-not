@@ -1,6 +1,17 @@
 export type Severity = 'positive' | 'low' | 'caution' | 'high' | 'critical';
 export type RiskLevel = 'LOW RISK' | 'GENERALLY LOW RISK' | 'CAUTION' | 'HIGH RISK' | 'VERY HIGH RISK';
 
+export type VerificationConfidence = 'Low' | 'Medium' | 'High';
+
+// Risk and confidence are tracked separately on purpose — "High risk, low
+// confidence" is a real, meaningful state ("we found warning signs but
+// couldn't verify much"), and collapsing them into one number would hide
+// that distinction.
+export interface RecommendedActionPlan {
+  steps: string[];
+  bottomLine: string;
+}
+
 export interface Finding {
   id: string;
   category: string;
@@ -33,6 +44,7 @@ export interface AnalysisResult {
   id: string;
   riskScore: number;
   riskLevel: RiskLevel;
+  verificationConfidence: VerificationConfidence;
   summary: string;
   majorWarnings: Finding[];
   cautionSignals: Finding[];
@@ -40,7 +52,7 @@ export interface AnalysisResult {
   verificationGaps: VerificationGap[];
   categories: CategoryResult[];
   opportunityQuality: OpportunityQuality;
-  recommendedAction: string;
+  recommendedAction: RecommendedActionPlan;
   createdAt: string;
   inputSummary: {
     company?: string;
@@ -79,6 +91,7 @@ export interface PublicAnalysisResult {
   id: string;
   riskScore: number;
   riskLevel: RiskLevel;
+  verificationConfidence: VerificationConfidence;
   summary: string;
   previewFinding: Finding | null;
   lockedFindingTitles: PublicFinding[];
@@ -95,6 +108,7 @@ export interface PublicAnalysisResult {
   qualityNotesLockedCount: number;
   recommendedActionPreview: string;
   recommendedActionHasMore: boolean;
+  actionStepsCount: number;
   createdAt: string;
   inputSummary: {
     company?: string;

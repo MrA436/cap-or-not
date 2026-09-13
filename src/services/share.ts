@@ -82,8 +82,12 @@ export function generateFullReport(result: AnalysisResult): string {
     lines.push('');
   }
 
-  lines.push('RECOMMENDED ACTION', '');
-  lines.push(result.recommendedAction);
+  lines.push('WHAT YOU SHOULD DO', '');
+  result.recommendedAction.steps.forEach((step, i) => {
+    lines.push(`  ${i + 1}. ${step}`);
+  });
+  lines.push('');
+  lines.push(`BOTTOM LINE: ${result.recommendedAction.bottomLine}`);
   lines.push('', '━━━━━━━━━━━━━━━━━━━━', '');
   lines.push('Cap or Not provides risk indicators, not a definitive scam determination.');
 
