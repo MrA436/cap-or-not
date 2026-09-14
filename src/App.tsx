@@ -1,5 +1,4 @@
 import { useEffect } from 'react';
-import { Analytics } from '@vercel/analytics/react';
 import { Routes, Route, useLocation } from 'react-router-dom';
 import Layout from '@/components/Layout';
 import LandingPage from '@/pages/LandingPage';
@@ -52,22 +51,19 @@ export default function App() {
   usePageMeta();
 
   return (
-    <>
-      <Layout>
-        <Routes>
-          <Route path="/" element={<LandingPage />} />
-          <Route path="/check" element={<CheckPage />} />
-          <Route path="/result/:id" element={<ResultPage />} />
-          <Route path="/how-it-works" element={<HowItWorksPage />} />
-          <Route path="/is-this-job-legit" element={<SEOPage content={isThisJobLegit} />} />
-          <Route path="/is-this-internship-legit" element={<SEOPage content={isThisInternshipLegit} />} />
-          <Route path="/is-this-recruiter-legit" element={<SEOPage content={isThisRecruiterLegit} />} />
-          <Route path="/fake-internship-signs" element={<SEOPage content={fakeInternshipSigns} />} />
-          <Route path="/job-scam-checker" element={<SEOPage content={jobScamChecker} />} />
-          <Route path="*" element={<NotFoundPage />} />
-        </Routes>
-      </Layout>
-      <Analytics />
-    </>
+    <Layout>
+      <Routes>
+        <Route path="/" element={<LandingPage />} />
+        <Route path="/check" element={<CheckPage />} />
+        <Route path="/result/:id" element={<ResultPage />} />
+        <Route path="/how-it-works" element={<HowItWorksPage />} />
+        <Route path="/is-this-job-legit" element={<SEOPage content={isThisJobLegit} />} />
+        <Route path="/is-this-internship-legit" element={<SEOPage content={isThisInternshipLegit} />} />
+        <Route path="/is-this-recruiter-legit" element={<SEOPage content={isThisRecruiterLegit} />} />
+        <Route path="/fake-internship-signs" element={<SEOPage content={fakeInternshipSigns} />} />
+        <Route path="/job-scam-checker" element={<SEOPage content={jobScamChecker} />} />
+        <Route path="*" element={<NotFoundPage />} />
+      </Routes>
+    </Layout>
   );
 }

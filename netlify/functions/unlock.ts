@@ -1,36 +1,36 @@
-import type { VercelRequest, VercelResponse } from '@vercel/node';
 import crypto from 'crypto';
-import { analyzeOpportunity } from '../src/services/analyzer.js';
-import type { OpportunityInput } from '../src/types/analysis.js';
+import { analyzeOpportunity } from '../../src/services/analyzer.js';
+import type { OpportunityInput } from '../../src/types/analysis.js';
+
+const json = (data: unknown, status = 200) =>
+  new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 
 // This is the fix for the paywall bypass: the full report is only ever
 // computed and returned here, AFTER the Razorpay signature is verified
 // against our server-only key secret. Nothing about "is this unlocked" is
 // ever decided in the browser.
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async (req: Request): Promise<Response> => {
   if (req.method !== 'POST') {
-    res.status(405).json({ error: 'Method not allowed' });
-    return;
+    return json({ error: 'Method not allowed' }, 405);
   }
 
   const keySecret = process.env.RAZORPAY_KEY_SECRET;
   if (!keySecret) {
     console.error('RAZORPAY_KEY_SECRET is not configured');
-    res.status(500).json({ error: 'Payments are not configured' });
-    return;
+    return json({ error: 'Payments are not configured' }, 500);
   }
 
   try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, input } = req.body as {
+    const body = (await req.json()) as {
       razorpay_order_id?: string;
       razorpay_payment_id?: string;
       razorpay_signature?: string;
       input?: Partial<OpportunityInput>;
     };
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, input } = body;
 
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !input) {
-      res.status(400).json({ error: 'Missing payment verification fields' });
-      return;
+      return json({ error: 'Missing payment verification fields' }, 400);
     }
 
     // Official Razorpay verification formula: HMAC-SHA256 of
@@ -50,8 +50,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       crypto.timingSafeEqual(expectedBuffer, actualBuffer);
 
     if (!isValid) {
-      res.status(400).json({ error: 'Payment could not be verified' });
-      return;
+      return json({ error: 'Payment could not be verified' }, 400);
     }
 
     // Signature is genuine — safe to recompute and return the full report.
@@ -69,9 +68,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     };
 
     const fullResult = await analyzeOpportunity(safeInput);
-    res.status(200).json({ fullResult });
+    return json({ fullResult });
   } catch (err) {
     console.error('unlock error', err);
-    res.status(500).json({ error: 'Unlock failed' });
+    return json({ error: 'Unlock failed' }, 500);
   }
-}
+};

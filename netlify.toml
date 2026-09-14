@@ -1,0 +1,23 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+# Preserve the existing /api/* URLs the frontend already calls, instead of
+# Netlify's default /.netlify/functions/* path — no frontend code needs to
+# change because of this.
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200
+
+# SPA fallback for client-side routing (React Router) — must come AFTER
+# the /api/* redirect above, since redirects are matched in order and the
+# first match wins.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

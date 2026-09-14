@@ -1,14 +1,15 @@
-import type { VercelRequest, VercelResponse } from '@vercel/node';
 import Razorpay from 'razorpay';
+
+const json = (data: unknown, status = 200) =>
+  new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 
 // Price lives here, server-side — never trust an amount sent from the
 // browser. Change this one line to change the price everywhere.
 const REPORT_PRICE_PAISE = 14900; // ₹149.00 (Razorpay amounts are in paise)
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async (req: Request): Promise<Response> => {
   if (req.method !== 'POST') {
-    res.status(405).json({ error: 'Method not allowed' });
-    return;
+    return json({ error: 'Method not allowed' }, 405);
   }
 
   const keyId = process.env.RAZORPAY_KEY_ID;
@@ -16,8 +17,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   if (!keyId || !keySecret) {
     console.error('Razorpay keys are not configured');
-    res.status(500).json({ error: 'Payments are not configured' });
-    return;
+    return json({ error: 'Payments are not configured' }, 500);
   }
 
   try {
@@ -31,7 +31,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // key_id is safe to return — it's the PUBLIC key, meant to be used in
     // the browser to open Checkout. key_secret never leaves this function.
-    res.status(200).json({
+    return json({
       orderId: order.id,
       amount: order.amount,
       currency: order.currency,
@@ -39,6 +39,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
   } catch (err) {
     console.error('create-order error', err);
-    res.status(500).json({ error: 'Could not create order' });
+    return json({ error: 'Could not create order' }, 500);
   }
-}
+};

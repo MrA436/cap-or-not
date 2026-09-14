@@ -1,23 +1,23 @@
-import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { analyzeOpportunity, toPublicResult } from '../src/services/analyzer.js';
-import type { OpportunityInput } from '../src/types/analysis.js';
+import { analyzeOpportunity, toPublicResult } from '../../src/services/analyzer.js';
+import type { OpportunityInput } from '../../src/types/analysis.js';
+
+const json = (data: unknown, status = 200) =>
+  new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 
 // This is the ONLY place the full analysis is computed for a fresh check.
 // The full result never leaves this function — only toPublicResult()'s
 // output is sent back. The full result is recomputed again, from scratch,
-// inside /api/unlock only after a real payment signature is verified.
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+// inside unlock.ts only after a real payment signature is verified.
+export default async (req: Request): Promise<Response> => {
   if (req.method !== 'POST') {
-    res.status(405).json({ error: 'Method not allowed' });
-    return;
+    return json({ error: 'Method not allowed' }, 405);
   }
 
   try {
-    const input = req.body as Partial<OpportunityInput>;
+    const input = (await req.json()) as Partial<OpportunityInput>;
 
     if (!input || typeof input !== 'object') {
-      res.status(400).json({ error: 'Invalid request body' });
-      return;
+      return json({ error: 'Invalid request body' }, 400);
     }
 
     // Basic shape safety — every field is treated as untrusted text, never
@@ -44,16 +44,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     ].some((v) => v.trim().length > 0);
 
     if (!hasContent) {
-      res.status(400).json({ error: 'At least one field is required' });
-      return;
+      return json({ error: 'At least one field is required' }, 400);
     }
 
     const fullResult = await analyzeOpportunity(safeInput);
     const publicResult = toPublicResult(fullResult);
 
-    res.status(200).json({ publicResult });
+    return json({ publicResult });
   } catch (err) {
     console.error('analyze error', err);
-    res.status(500).json({ error: 'Analysis failed' });
+    return json({ error: 'Analysis failed' }, 500);
   }
-}
+};
