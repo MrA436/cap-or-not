@@ -187,12 +187,28 @@ function isSubdomain(domain: string, rootDomain: string): boolean {
   return domain !== rootDomain && domain.endsWith(`.${rootDomain}`);
 }
 
-function computeRiskLevel(score: number): RiskLevel {
-  if (score <= 20) return 'LOW RISK';
-  if (score <= 40) return 'GENERALLY LOW RISK';
-  if (score <= 60) return 'CAUTION';
-  if (score <= 80) return 'HIGH RISK';
-  return 'VERY HIGH RISK';
+const RISK_LEVEL_ORDER: RiskLevel[] = ['LOW RISK', 'GENERALLY LOW RISK', 'CAUTION', 'HIGH RISK', 'VERY HIGH RISK'];
+
+function computeRiskLevel(score: number, majorWarnings: Finding[]): RiskLevel {
+  let level: RiskLevel;
+  if (score <= 20) level = 'LOW RISK';
+  else if (score <= 40) level = 'GENERALLY LOW RISK';
+  else if (score <= 60) level = 'CAUTION';
+  else if (score <= 80) level = 'HIGH RISK';
+  else level = 'VERY HIGH RISK';
+
+  // A single genuine critical-severity finding (an explicit payment
+  // demand, a lookalike domain, etc.) is strong enough on its own that
+  // the overall risk level should never undersell it just because the
+  // cumulative score happened to land in a low band. This is the "one
+  // strong financial-category hit should outweigh several weak hits"
+  // principle from the checklist, applied to the final level too, not
+  // just to individual score contributions.
+  const hasCritical = majorWarnings.some((f) => f.severity === 'critical');
+  const hasMultipleHigh = majorWarnings.filter((f) => f.severity === 'high' || f.severity === 'critical').length >= 2;
+  const floor: RiskLevel = hasCritical ? 'HIGH RISK' : hasMultipleHigh ? 'CAUTION' : 'LOW RISK';
+
+  return RISK_LEVEL_ORDER.indexOf(floor) > RISK_LEVEL_ORDER.indexOf(level) ? floor : level;
 }
 
 interface CategoryAnalysis {
@@ -1366,13 +1382,13 @@ export async function analyzeOpportunity(input: OpportunityInput): Promise<Analy
 
   const totalScore = Math.min(100, categories.reduce((sum, c) => sum + c.scoreContribution, 0));
   const score = Math.round(totalScore);
-  const riskLevel = computeRiskLevel(score);
 
   const majorWarnings = allFindings.filter((f) => f.severity === 'high' || f.severity === 'critical');
   const cautionSignals = allFindings.filter((f) => f.severity === 'caution' || f.severity === 'low');
   const positiveSignals = allPositives;
   const verificationGaps = allGaps.map((g) => ({ item: g }));
 
+  const riskLevel = computeRiskLevel(score, majorWarnings);
   const summary = buildSummary(score, riskLevel, majorWarnings, cautionSignals);
   const recommendedAction = buildRecommendedAction(allFindings);
   const opportunityQuality = assessOpportunityQuality(effectiveInput);

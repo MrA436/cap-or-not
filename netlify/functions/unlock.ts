@@ -1,9 +1,13 @@
 import crypto from 'crypto';
 import { analyzeOpportunity } from '../../src/services/analyzer.js';
 import type { OpportunityInput } from '../../src/types/analysis.js';
+import { checkRateLimit, getClientIp } from '../../src/services/rateLimit.js';
 
-const json = (data: unknown, status = 200) =>
-  new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
+const json = (data: unknown, status = 200, extraHeaders?: Record<string, string>) =>
+  new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...extraHeaders },
+  });
 
 // This is the fix for the paywall bypass: the full report is only ever
 // computed and returned here, AFTER the Razorpay signature is verified
@@ -12,6 +16,19 @@ const json = (data: unknown, status = 200) =>
 export default async (req: Request): Promise<Response> => {
   if (req.method !== 'POST') {
     return json({ error: 'Method not allowed' }, 405);
+  }
+
+  const ip = getClientIp(req);
+  // More generous than the other endpoints — this is already gated by a
+  // real signature check, so the limit here is just to stop someone
+  // hammering it with junk requests, not to protect against bypass.
+  const rateLimit = checkRateLimit(`unlock:${ip}`, 20, 60_000); // 20/minute/IP
+  if (!rateLimit.allowed) {
+    return json(
+      { error: 'Too many requests. Please wait a moment and try again.' },
+      429,
+      rateLimit.retryAfterSeconds ? { 'Retry-After': String(rateLimit.retryAfterSeconds) } : undefined,
+    );
   }
 
   const keySecret = process.env.RAZORPAY_KEY_SECRET;

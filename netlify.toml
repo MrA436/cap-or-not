@@ -6,6 +6,20 @@
   directory = "netlify/functions"
   node_bundler = "esbuild"
 
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    # Scoped to exactly what Razorpay Checkout needs to load and call:
+    # checkout.razorpay.com (the widget script + its own iframe),
+    # api.razorpay.com (payment calls) and lumberjack.razorpay.com
+    # (the widget's own analytics beacon). Don't tighten this further
+    # without testing a real payment end-to-end — it's easy to silently
+    # break Checkout by being too restrictive here.
+    Content-Security-Policy = "default-src 'self'; script-src 'self' https://checkout.razorpay.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https://api.razorpay.com https://checkout.razorpay.com https://lumberjack.razorpay.com; frame-src https://api.razorpay.com https://checkout.razorpay.com; object-src 'none'; base-uri 'self'; form-action 'self'"
+
 # Preserve the existing /api/* URLs the frontend already calls, instead of
 # Netlify's default /.netlify/functions/* path — no frontend code needs to
 # change because of this.

@@ -1,8 +1,12 @@
 import { analyzeOpportunity, toPublicResult } from '../../src/services/analyzer.js';
 import type { OpportunityInput } from '../../src/types/analysis.js';
+import { checkRateLimit, getClientIp } from '../../src/services/rateLimit.js';
 
-const json = (data: unknown, status = 200) =>
-  new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
+const json = (data: unknown, status = 200, extraHeaders?: Record<string, string>) =>
+  new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...extraHeaders },
+  });
 
 // This is the ONLY place the full analysis is computed for a fresh check.
 // The full result never leaves this function — only toPublicResult()'s
@@ -11,6 +15,16 @@ const json = (data: unknown, status = 200) =>
 export default async (req: Request): Promise<Response> => {
   if (req.method !== 'POST') {
     return json({ error: 'Method not allowed' }, 405);
+  }
+
+  const ip = getClientIp(req);
+  const rateLimit = checkRateLimit(`analyze:${ip}`, 10, 60_000); // 10 checks/minute/IP
+  if (!rateLimit.allowed) {
+    return json(
+      { error: 'Too many requests. Please wait a moment and try again.' },
+      429,
+      rateLimit.retryAfterSeconds ? { 'Retry-After': String(rateLimit.retryAfterSeconds) } : undefined,
+    );
   }
 
   try {
