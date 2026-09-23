@@ -32,45 +32,66 @@ export default async (req: Request): Promise<Response> => {
   }
 
   const keySecret = process.env.RAZORPAY_KEY_SECRET;
-  if (!keySecret) {
-    console.error('RAZORPAY_KEY_SECRET is not configured');
-    return json({ error: 'Payments are not configured' }, 500);
-  }
+  const testUnlockCode = process.env.TEST_UNLOCK_CODE;
 
   try {
     const body = (await req.json()) as {
       razorpay_order_id?: string;
       razorpay_payment_id?: string;
       razorpay_signature?: string;
+      testCode?: string;
       input?: Partial<OpportunityInput>;
     };
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, input } = body;
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, testCode, input } = body;
 
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !input) {
-      return json({ error: 'Missing payment verification fields' }, 400);
+    if (!input) {
+      return json({ error: 'Missing input' }, 400);
     }
 
-    // Official Razorpay verification formula: HMAC-SHA256 of
-    // "order_id|payment_id" using the key secret, compared to the
-    // signature Checkout returned. If this doesn't match, either the
-    // payment wasn't real or the data was tampered with in transit.
-    const expectedSignature = crypto
-      .createHmac('sha256', keySecret)
-      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-      .digest('hex');
+    // Test/dev bypass: only usable at all if TEST_UNLOCK_CODE is actually
+    // set in the environment (unset in production if you don't want this
+    // path to exist), and only succeeds if the submitted code matches it
+    // exactly. The real code value never reaches the browser — it's
+    // compared server-side only, same trust boundary as the Razorpay
+    // secret below.
+    let verified = false;
+    if (testUnlockCode && testCode) {
+      verified = testCode === testUnlockCode;
+      if (!verified) {
+        return json({ error: 'Invalid access code' }, 400);
+      }
+    } else {
+      if (!keySecret) {
+        console.error('RAZORPAY_KEY_SECRET is not configured');
+        return json({ error: 'Payments are not configured' }, 500);
+      }
+      if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+        return json({ error: 'Missing payment verification fields' }, 400);
+      }
 
-    const expectedBuffer = new Uint8Array(Buffer.from(expectedSignature, 'utf-8'));
-    const actualBuffer = new Uint8Array(Buffer.from(razorpay_signature, 'utf-8'));
+      // Official Razorpay verification formula: HMAC-SHA256 of
+      // "order_id|payment_id" using the key secret, compared to the
+      // signature Checkout returned. If this doesn't match, either the
+      // payment wasn't real or the data was tampered with in transit.
+      const expectedSignature = crypto
+        .createHmac('sha256', keySecret)
+        .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+        .digest('hex');
 
-    const isValid =
-      expectedBuffer.length === actualBuffer.length &&
-      crypto.timingSafeEqual(expectedBuffer, actualBuffer);
+      const expectedBuffer = new Uint8Array(Buffer.from(expectedSignature, 'utf-8'));
+      const actualBuffer = new Uint8Array(Buffer.from(razorpay_signature, 'utf-8'));
 
-    if (!isValid) {
-      return json({ error: 'Payment could not be verified' }, 400);
+      verified =
+        expectedBuffer.length === actualBuffer.length &&
+        crypto.timingSafeEqual(expectedBuffer, actualBuffer);
+
+      if (!verified) {
+        return json({ error: 'Payment could not be verified' }, 400);
+      }
     }
 
-    // Signature is genuine — safe to recompute and return the full report.
+    // Signature or test code is genuine — safe to recompute and return
+    // the full report.
     const safeInput: OpportunityInput = {
       company: String(input.company ?? '').slice(0, 500),
       recruiterName: String(input.recruiterName ?? '').slice(0, 200),

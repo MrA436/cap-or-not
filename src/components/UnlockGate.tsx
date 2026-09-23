@@ -40,6 +40,10 @@ function loadRazorpayScript(): Promise<void> {
 export default function UnlockGate({ input, onUnlocked }: UnlockGateProps) {
   const [status, setStatus] = useState<'idle' | 'loading' | 'error'>('idle');
   const [errorMsg, setErrorMsg] = useState('');
+  const [showCodeInput, setShowCodeInput] = useState(false);
+  const [code, setCode] = useState('');
+  const [codeStatus, setCodeStatus] = useState<'idle' | 'loading' | 'error'>('idle');
+  const [codeError, setCodeError] = useState('');
 
   const handlePay = async () => {
     setStatus('loading');
@@ -90,6 +94,29 @@ export default function UnlockGate({ input, onUnlocked }: UnlockGateProps) {
     }
   };
 
+  const handleCodeSubmit = async () => {
+    if (!code.trim()) return;
+    setCodeStatus('loading');
+    setCodeError('');
+    try {
+      const res = await fetch('/api/unlock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ testCode: code.trim(), input }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.error ?? 'Invalid code');
+      }
+      const { fullResult } = await res.json();
+      onUnlocked(fullResult);
+      setCodeStatus('idle');
+    } catch (err) {
+      setCodeStatus('error');
+      setCodeError(err instanceof Error ? err.message : 'Invalid code');
+    }
+  };
+
   return (
     <div className="bg-white rounded-xl border border-gray-200 shadow-lg p-6 text-center">
       <div className="inline-flex items-center justify-center w-11 h-11 rounded-full bg-gray-900 mb-3">
@@ -118,6 +145,38 @@ export default function UnlockGate({ input, onUnlocked }: UnlockGateProps) {
       </button>
       {errorMsg && <p className="mt-3 text-xs text-red-600">{errorMsg}</p>}
       <p className="mt-3 text-xs text-gray-400">Secure payment via Razorpay</p>
+
+      {!showCodeInput ? (
+        <button
+          onClick={() => setShowCodeInput(true)}
+          className="mt-2 text-xs text-gray-300 hover:text-gray-500 underline"
+        >
+          Have an access code?
+        </button>
+      ) : (
+        <div className="mt-3 flex items-center gap-2">
+          <input
+            type="text"
+            value={code}
+            onChange={(e) => {
+              setCode(e.target.value);
+              setCodeStatus('idle');
+              setCodeError('');
+            }}
+            onKeyDown={(e) => e.key === 'Enter' && handleCodeSubmit()}
+            placeholder="Enter code"
+            className="flex-1 text-sm border border-gray-300 rounded-md px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-gray-900"
+          />
+          <button
+            onClick={handleCodeSubmit}
+            disabled={codeStatus === 'loading'}
+            className="text-sm font-medium bg-gray-100 hover:bg-gray-200 disabled:bg-gray-50 text-gray-800 px-3 py-1.5 rounded-md transition-colors flex-shrink-0"
+          >
+            {codeStatus === 'loading' ? '...' : 'Apply'}
+          </button>
+        </div>
+      )}
+      {codeError && <p className="mt-2 text-xs text-red-600">{codeError}</p>}
     </div>
   );
 }

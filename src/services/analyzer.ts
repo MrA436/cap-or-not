@@ -10,6 +10,7 @@ import type {
   RecommendedActionPlan,
 } from '../types/analysis.js';
 import { lookupDomainAge } from './rdap.js';
+import { checkWebsiteReachable } from './websiteCheck.js';
 
 function getDomainFromUrl(url: string): string | null {
   try {
@@ -148,6 +149,33 @@ function nextId(): string {
   return `finding-${findingCounter}`;
 }
 
+const NEGATION_MARKERS = [
+  'no', 'not', 'without', 'never', 'none', "isn't", "aren't", "doesn't",
+  "don't", "won't", 'isnt', 'arent', 'doesnt', 'dont', 'wont', 'lacking', 'lacks',
+];
+
+/**
+ * True if `keyword` appears in `text` at least once WITHOUT a negation
+ * word (no, not, without, never, ...) within the preceding ~25
+ * characters. This is what "positive signal" checks need to use instead
+ * of a bare .includes() — otherwise "No technical interview is required"
+ * gets read as "interview mentioned = good sign", which is exactly
+ * backwards. If every occurrence of the keyword is negated (or the
+ * keyword never appears at all), this returns false.
+ */
+function hasNonNegatedMention(text: string, keyword: string, windowChars = 25): boolean {
+  const lower = text.toLowerCase();
+  const kw = keyword.toLowerCase();
+  let idx = lower.indexOf(kw);
+  while (idx !== -1) {
+    const before = lower.slice(Math.max(0, idx - windowChars), idx);
+    const negated = NEGATION_MARKERS.some((n) => new RegExp(`\\b${n}\\b`).test(before));
+    if (!negated) return true;
+    idx = lower.indexOf(kw, idx + kw.length);
+  }
+  return false;
+}
+
 function containsAny(text: string, keywords: string[]): string[] {
   // Word-boundary matching, not raw substring containment. Substring
   // matching was causing real false positives — e.g. the keyword "ether"
@@ -253,16 +281,14 @@ function analyzeCompany(input: OpportunityInput): CategoryAnalysis {
       const isConsistent = domainSlug.includes(companyNameSlug.slice(0, 4)) ||
         companyNameSlug.includes(domainSlug.slice(0, 4));
       if (isConsistent) {
-        positives.push({
-          id: nextId(),
-          category: 'company',
-          severity: 'positive',
-          title: 'Company website appears consistent',
-          finding: 'The supplied company website domain appears to match the company name.',
-          evidence: `${input.company} — ${input.companyWebsite}`,
-          explanation: 'A matching domain is a positive signal, though it should still be independently verified.',
-          action: 'Visit the website and confirm it is active and professional.',
-        });
+        // A loose string match between the typed company name and the
+        // domain is not real evidence of a verified relationship —
+        // anyone can type any name next to any URL. This is honestly a
+        // verification gap, not a confirmed positive, unless something
+        // actually ties the two together (e.g. the website reachability
+        // check below, or a future check that reads the site's own
+        // stated name). Absence of a mismatch isn't presence of proof.
+        gaps.push(`Whether "${input.company}" and the domain "${domain}" are actually the same entity`);
       } else {
         findings.push({
           id: nextId(),
@@ -788,7 +814,10 @@ function analyzeRecruitmentProcess(input: OpportunityInput): CategoryAnalysis {
     scoreContribution += 12;
   }
 
-  if (lower.includes('interview') && (lower.includes('round') || lower.includes('technical') || lower.includes('hr round'))) {
+  if (
+    hasNonNegatedMention(text, 'interview') &&
+    (hasNonNegatedMention(text, 'round') || hasNonNegatedMention(text, 'technical') || hasNonNegatedMention(text, 'hr round'))
+  ) {
     positives.push({
       id: nextId(),
       category: 'process',
@@ -1024,7 +1053,7 @@ function analyzeOfferLetter(input: OpportunityInput): CategoryAnalysis {
     scoreContribution += 20;
   }
 
-  if (lower.includes('salary') || lower.includes('stipend')) {
+  if (hasNonNegatedMention(text, 'salary') || hasNonNegatedMention(text, 'stipend')) {
     positives.push({
       id: nextId(),
       category: 'offer',
@@ -1139,7 +1168,7 @@ function assessOpportunityQuality(input: OpportunityInput): OpportunityQuality {
     qualityScore += 1;
   }
 
-  if (lower.includes('interview') || lower.includes('assessment')) {
+  if (hasNonNegatedMention(text, 'interview') || hasNonNegatedMention(text, 'assessment')) {
     notes.push('A structured selection process is described.');
     qualityScore += 1;
   }
@@ -1336,6 +1365,52 @@ async function applyDomainAgeSignal(input: OpportunityInput, companyCategory: Ca
   companyCategory.riskLevel = companyCategory.scoreContribution > 15 ? 'high' : companyCategory.scoreContribution > 5 ? 'caution' : 'low';
 }
 
+/**
+ * Actually visits the claimed website to confirm something real is
+ * running there — RDAP only confirms the domain is *registered*, which
+ * is a different fact from a site actually existing and responding.
+ */
+async function applyWebsiteReachabilitySignal(input: OpportunityInput, companyCategory: CategoryAnalysis): Promise<void> {
+  if (!input.companyWebsite.trim()) return;
+
+  const result = await checkWebsiteReachable(input.companyWebsite);
+
+  if (result.status === 'unable_to_verify') {
+    companyCategory.gaps.push('Whether the website URL is well-formed and reachable');
+    return;
+  }
+
+  if (result.status === 'unreachable') {
+    companyCategory.findings.push({
+      id: nextId(),
+      category: 'company',
+      severity: 'high',
+      title: `Website "${input.companyWebsite.trim()}" could not be reached`,
+      finding: 'The claimed company website did not respond to a direct request — it may not exist, may be misspelled, or may not be currently online.',
+      evidence: `Attempted to reach: ${input.companyWebsite.trim()}`,
+      explanation: 'A company claiming an official website that does not actually respond is a meaningful red flag — this is different from, and more concrete than, the domain simply being new.',
+      action: 'Independently search for the company\'s real website before proceeding. Do not trust a link sent to you without verifying it separately.',
+    });
+    companyCategory.scoreContribution += 22;
+    companyCategory.riskLevel = companyCategory.scoreContribution > 15 ? 'high' : companyCategory.scoreContribution > 5 ? 'caution' : 'low';
+    return;
+  }
+
+  // "Reachable" includes any real HTTP response, even an error status —
+  // that still proves a real server answered, which is the actual fact
+  // being checked here (not whether the page itself looks good).
+  companyCategory.positives.push({
+    id: nextId(),
+    category: 'company',
+    severity: 'positive',
+    title: 'Company website is live and reachable',
+    finding: 'The claimed company website responded to a direct request.',
+    evidence: `${input.companyWebsite.trim()} responded${result.httpStatus ? ` (HTTP ${result.httpStatus})` : ''}`,
+    explanation: 'This confirms a real server exists at this address — it does not by itself confirm the site or company are legitimate.',
+    action: 'Continue verifying other details as normal.',
+  });
+}
+
 export async function analyzeOpportunity(input: OpportunityInput): Promise<AnalysisResult> {
   findingCounter = 0;
 
@@ -1363,6 +1438,7 @@ export async function analyzeOpportunity(input: OpportunityInput): Promise<Analy
   const companyCategory = analyzeCompany(effectiveInput);
   if (inferredCompanyFinding) companyCategory.positives.push(inferredCompanyFinding);
   await applyDomainAgeSignal(effectiveInput, companyCategory);
+  await applyWebsiteReachabilitySignal(effectiveInput, companyCategory);
 
   const categories: CategoryAnalysis[] = [
     companyCategory,

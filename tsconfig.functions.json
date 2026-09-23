@@ -10,5 +10,5 @@
     "resolveJsonModule": true,
     "types": ["node"]
   },
-  "include": ["netlify/functions/**/*.ts", "src/types/analysis.ts", "src/services/analyzer.ts", "src/services/rdap.ts", "src/services/rateLimit.ts"]
+  "include": ["netlify/functions/**/*.ts", "src/types/analysis.ts", "src/services/analyzer.ts", "src/services/rdap.ts", "src/services/rateLimit.ts", "src/services/websiteCheck.ts"]
 }
