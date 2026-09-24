@@ -14,35 +14,49 @@ import {
   fakeInternshipSigns,
   jobScamChecker,
 } from '@/pages/seoContent';
+import { SITE_URL, pageMeta, buildJsonLd, DEFAULT_TITLE, DEFAULT_DESCRIPTION } from '@/seo/meta';
 
-const pageMeta: Record<string, { title: string; description: string }> = {
-  '/': {
-    title: 'Cap or Not — Is This Job or Internship Legit?',
-    description: 'Paste a job posting, recruiter message, or offer letter. Cap or Not checks for common risk signals and tells you what\'s sus and what\'s not.',
-  },
-  '/check': {
-    title: 'Cap Check It — Cap or Not',
-    description: 'Submit a job or internship offer and get a straight-up risk assessment with the evidence to back it up.',
-  },
-  '/how-it-works': {
-    title: 'How Cap or Not Works — Risk Signals & Verification',
-    description: 'Learn how Cap or Not evaluates job and internship opportunities across multiple risk categories.',
-  },
-  '/is-this-job-legit': { title: isThisJobLegit.title, description: isThisJobLegit.metaDescription },
-  '/is-this-internship-legit': { title: isThisInternshipLegit.title, description: isThisInternshipLegit.metaDescription },
-  '/is-this-recruiter-legit': { title: isThisRecruiterLegit.title, description: isThisRecruiterLegit.metaDescription },
-  '/fake-internship-signs': { title: fakeInternshipSigns.title, description: fakeInternshipSigns.metaDescription },
-  '/job-scam-checker': { title: jobScamChecker.title, description: jobScamChecker.metaDescription },
-};
+function setMetaTag(selector: string, attr: string, value: string) {
+  const el = document.querySelector(selector);
+  if (el) el.setAttribute(attr, value);
+}
 
 function usePageMeta() {
   const { pathname } = useLocation();
   useEffect(() => {
     const meta = pageMeta[pathname];
-    document.title = meta?.title ?? 'Cap or Not — Job & Internship Cap Checker';
-    const descTag = document.querySelector('meta[name="description"]');
-    if (descTag) {
-      descTag.setAttribute('content', meta?.description ?? 'Find out if that job or internship offer is cap before you trust it.');
+    const title = meta?.title ?? DEFAULT_TITLE;
+    const description = meta?.description ?? DEFAULT_DESCRIPTION;
+    const canonicalUrl = `${SITE_URL}${pathname === '/' ? '' : pathname}`;
+
+    document.title = title;
+    setMetaTag('meta[name="description"]', 'content', description);
+    setMetaTag('meta[property="og:title"]', 'content', title);
+    setMetaTag('meta[property="og:description"]', 'content', description);
+    setMetaTag('meta[property="og:url"]', 'content', canonicalUrl);
+    setMetaTag('meta[name="twitter:title"]', 'content', title);
+    setMetaTag('meta[name="twitter:description"]', 'content', description);
+    setMetaTag('link[rel="canonical"]', 'href', canonicalUrl);
+
+    // Dynamic pages (a specific /result/:id) don't have a canonical/og
+    // representation worth indexing, and robots.txt already excludes
+    // /result/ — this just keeps the tags from lying about those pages too.
+    const isDynamic = pathname.startsWith('/result/');
+    const ogUrlTag = document.querySelector('meta[property="og:url"]');
+    if (isDynamic && ogUrlTag) ogUrlTag.setAttribute('content', SITE_URL);
+
+    let jsonLdTag = document.getElementById('page-jsonld') as HTMLScriptElement | null;
+    const jsonLd = buildJsonLd(pathname);
+    if (jsonLd) {
+      if (!jsonLdTag) {
+        jsonLdTag = document.createElement('script');
+        jsonLdTag.id = 'page-jsonld';
+        jsonLdTag.type = 'application/ld+json';
+        document.head.appendChild(jsonLdTag);
+      }
+      jsonLdTag.textContent = JSON.stringify(jsonLd);
+    } else if (jsonLdTag) {
+      jsonLdTag.remove();
     }
   }, [pathname]);
 }

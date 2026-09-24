@@ -88,6 +88,9 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               <Link to="/check" className="hover:text-gray-900 transition-colors">Check</Link>
               <Link to="/how-it-works" className="hover:text-gray-900 transition-colors">How It Works</Link>
               <Link to="/is-this-job-legit" className="hover:text-gray-900 transition-colors">Is This Job Legit?</Link>
+              <Link to="/is-this-internship-legit" className="hover:text-gray-900 transition-colors">Is This Internship Legit?</Link>
+              <Link to="/is-this-recruiter-legit" className="hover:text-gray-900 transition-colors">Is This Recruiter Legit?</Link>
+              <Link to="/fake-internship-signs" className="hover:text-gray-900 transition-colors">Fake Internship Signs</Link>
               <Link to="/job-scam-checker" className="hover:text-gray-900 transition-colors">Job Scam Checker</Link>
             </nav>
           </div>

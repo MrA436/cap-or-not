@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+Disallow: /result/
+
+Sitemap: https://capornot.com/sitemap.xml
