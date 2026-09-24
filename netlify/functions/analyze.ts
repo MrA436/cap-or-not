@@ -1,6 +1,7 @@
 import { analyzeOpportunity, toPublicResult } from '../../src/services/analyzer.js';
-import type { OpportunityInput } from '../../src/types/analysis.js';
+import type { OpportunityInput, AnalyzeResponse } from '../../src/types/analysis.js';
 import { checkRateLimit, getClientIp } from '../../src/services/rateLimit.js';
+import { consumeFreeCheck } from '../../src/services/freeChecks.js';
 
 const json = (data: unknown, status = 200, extraHeaders?: Record<string, string>) =>
   new Response(JSON.stringify(data), {
@@ -64,7 +65,18 @@ export default async (req: Request): Promise<Response> => {
     const fullResult = await analyzeOpportunity(safeInput);
     const publicResult = toPublicResult(fullResult);
 
-    return json({ publicResult });
+    // 5 free checks, lifetime, per IP (best-effort — see freeChecks.ts).
+    // If one's available, hand back the full report right away instead of
+    // making them pay for a check they're entitled to for free.
+    const freeCheck = consumeFreeCheck(ip);
+
+    const response: AnalyzeResponse = {
+      publicResult,
+      fullResult: freeCheck.granted ? fullResult : null,
+      freeChecksRemaining: freeCheck.remaining,
+    };
+
+    return json(response);
   } catch (err) {
     console.error('analyze error', err);
     return json({ error: 'Analysis failed' }, 500);

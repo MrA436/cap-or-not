@@ -171,8 +171,8 @@ export const jobScamChecker: SEOContent = {
       ],
     },
     {
-      heading: 'Two free checks, no account required',
-      body: 'You can check two opportunities for free without creating an account. Each report includes a risk score, categorized findings, evidence from your input, verification gaps, and recommended actions. Reports can be copied or shared.',
+      heading: 'Five free checks, no account required',
+      body: 'You get 5 free full reports for life, no account required — after that, unlocking a report is a small one-time payment per check. Each report includes a risk score, categorized findings, evidence from your input, verification gaps, and recommended actions. Reports can be copied or shared.',
     },
   ],
 };

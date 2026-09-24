@@ -68,6 +68,7 @@ export default function ResultPage() {
         fullResult={fullResult}
         input={check.input}
         onUnlocked={handleUnlocked}
+        freeChecksRemaining={check.freeChecksRemaining}
       />
     </div>
   );

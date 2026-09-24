@@ -87,6 +87,18 @@ export interface PublicFinding {
 // It deliberately does not include the full Finding objects, the full
 // category evidence, or the full opportunityQuality notes — those only
 // exist server-side until /api/unlock confirms payment.
+// Response shape for POST /api/analyze. fullResult is only non-null when
+// the caller still had a free check available — see freeChecks.ts — in
+// which case the browser gets the complete report immediately, no
+// payment step. Once freeChecksRemaining has been 0 for a caller,
+// fullResult will be null here and the normal UnlockGate/payment flow
+// (publicResult -> /api/unlock) takes over, unchanged.
+export interface AnalyzeResponse {
+  publicResult: PublicAnalysisResult;
+  fullResult: AnalysisResult | null;
+  freeChecksRemaining: number;
+}
+
 export interface PublicAnalysisResult {
   id: string;
   riskScore: number;

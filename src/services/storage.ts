@@ -7,6 +7,10 @@ interface StoredCheck {
   publicResult: PublicAnalysisResult;
   input: OpportunityInput;
   fullResult: AnalysisResult | null;
+  // How many of the 5 lifetime free checks were left *after* this one, per
+  // /api/analyze's response. Undefined for checks saved before this field
+  // existed — treat that the same as "unknown", not "zero".
+  freeChecksRemaining?: number;
 }
 
 /**
@@ -16,11 +20,11 @@ interface StoredCheck {
  * verified, at which point /api/unlock returns it and we cache it here
  * for the rest of this browser session only.
  */
-export function saveCheck(publicResult: PublicAnalysisResult, input: OpportunityInput): void {
+export function saveCheck(publicResult: PublicAnalysisResult, input: OpportunityInput, freeChecksRemaining?: number): void {
   try {
     const raw = sessionStorage.getItem(CHECKS_KEY);
     const all: StoredCheck[] = raw ? JSON.parse(raw) : [];
-    all.unshift({ publicResult, input, fullResult: null });
+    all.unshift({ publicResult, input, fullResult: null, freeChecksRemaining });
     sessionStorage.setItem(CHECKS_KEY, JSON.stringify(all.slice(0, MAX_STORED)));
   } catch {
     // storage unavailable — the result page will just show "not found"

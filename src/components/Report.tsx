@@ -1,9 +1,13 @@
-import type { AnalysisResult, PublicAnalysisResult, PublicFinding, OpportunityInput, Finding } from '@/types/analysis';
+import type { AnalysisResult, PublicAnalysisResult, PublicFinding, OpportunityInput, CategoryResult } from '@/types/analysis';
 import RiskScore from './RiskScore';
 import FindingCard from './FindingCard';
 import OpportunityQualityCard from './OpportunityQualityCard';
 import UnlockGate from './UnlockGate';
-import { AlertTriangle, AlertCircle, CheckCircle2, Search, Copy, Share2, Clock, Lock, ShieldCheck } from 'lucide-react';
+import {
+  AlertTriangle, AlertCircle, CheckCircle2, Search, Copy, Share2, Clock, Lock, ShieldCheck,
+  DollarSign, RefreshCw, FileCheck, FileText, Building2, UserCheck, Mail, HelpCircle,
+  type LucideIcon,
+} from 'lucide-react';
 import { useState, useEffect } from 'react';
 import { generateShareSummary, generateFullReport, copyToClipboard } from '@/services/share';
 
@@ -12,6 +16,10 @@ interface ReportProps {
   fullResult: AnalysisResult | null;
   input: OpportunityInput;
   onUnlocked: (fullResult: AnalysisResult) => void;
+  // From AnalyzeResponse via storage.ts. Undefined for checks saved before
+  // this existed, or if this report was unlocked via payment/code rather
+  // than a free credit — in all those cases we just don't show the banner.
+  freeChecksRemaining?: number;
 }
 
 const qualityRatingStyle: Record<string, { color: string; bg: string; border: string }> = {
@@ -26,30 +34,57 @@ const confidenceStyle: Record<string, string> = {
   Low: 'text-gray-500',
 };
 
-// Findings are grouped by SUBJECT for the unlocked report (Company, then
-// Recruiter, then Job/Internship, then Claims) rather than by severity —
-// this reads like an actual audit ("here's everything about the
-// recruiter") instead of a flat list sorted by how scary each item is.
-const SUBJECT_GROUPS: { label: string; categories: string[] }[] = [
-  { label: 'Company Verification', categories: ['company'] },
-  { label: 'Recruiter Verification', categories: ['recruiter', 'email'] },
-  { label: 'Job / Internship Analysis', categories: ['job', 'payment', 'process', 'offer', 'sensitive'] },
-  { label: 'Claim Verification', categories: ['brand'] },
+// --- Opportunity Analysis: WHAT was checked, grouped by topic ---
+// Each of the 9 CategoryResult entries the analyzer produces (one per
+// CategoryAnalysis.category, e.g. "Company Verification") is folded into
+// one of 7 topic groups here. This is a display-only regrouping — it
+// doesn't change what the analyzer computes, just how the unlocked report
+// presents it: a scannable "here's what we looked at" overview, separate
+// from the "here's what we found" severity list below it (Risk Signals).
+const TOPIC_GROUPS: { label: string; icon: LucideIcon; categoryNames: string[] }[] = [
+  { label: 'Payment', icon: DollarSign, categoryNames: ['Payment / Money Detection'] },
+  { label: 'Process', icon: RefreshCw, categoryNames: ['Recruitment Process'] },
+  { label: 'Claims', icon: FileCheck, categoryNames: ['Job Posting Analysis', 'Brand / Government Affiliation'] },
+  { label: 'Documents', icon: FileText, categoryNames: ['Offer Letter Analysis', 'Sensitive Information'] },
+  { label: 'Company', icon: Building2, categoryNames: ['Company Verification'] },
+  { label: 'Recruiter', icon: UserCheck, categoryNames: ['Recruiter Identity'] },
+  { label: 'Email / Domain', icon: Mail, categoryNames: ['Email / Domain Analysis'] },
 ];
 
-const severityRank: Record<string, number> = { critical: 0, high: 1, caution: 2, low: 3, positive: 4 };
+// Worse-first priority so combining multiple CategoryResults into one
+// topic group (e.g. Claims = Job Posting + Brand Affiliation) surfaces
+// the more concerning of the two rather than averaging them away.
+const STATUS_PRIORITY: CategoryResult['status'][] = ['suspicious', 'unable', 'partial', 'verified'];
 
-function groupFindingsBySubject(fullResult: AnalysisResult): { label: string; findings: Finding[] }[] {
-  const all = [...fullResult.majorWarnings, ...fullResult.cautionSignals, ...fullResult.positiveSignals];
-  return SUBJECT_GROUPS
-    .map((group) => ({
-      label: group.label,
-      findings: all
-        .filter((f) => group.categories.includes(f.category))
-        .sort((a, b) => severityRank[a.severity] - severityRank[b.severity]),
-    }))
-    .filter((g) => g.findings.length > 0);
+const STATUS_STYLE: Record<CategoryResult['status'], { icon: LucideIcon; color: string; bg: string; border: string; label: string }> = {
+  suspicious: { icon: AlertTriangle, color: 'text-red-600', bg: 'bg-red-50', border: 'border-red-200', label: 'Concerns found' },
+  unable: { icon: HelpCircle, color: 'text-gray-500', bg: 'bg-gray-50', border: 'border-gray-200', label: 'Not enough info' },
+  partial: { icon: AlertCircle, color: 'text-amber-600', bg: 'bg-amber-50', border: 'border-amber-200', label: 'Partially checked' },
+  verified: { icon: CheckCircle2, color: 'text-emerald-600', bg: 'bg-emerald-50', border: 'border-emerald-200', label: 'Checks out' },
+};
+
+interface TopicSummary {
+  label: string;
+  icon: LucideIcon;
+  status: CategoryResult['status'];
+  evidence: string[];
 }
+
+function buildOpportunityAnalysis(fullResult: AnalysisResult): TopicSummary[] {
+  return TOPIC_GROUPS.map((group) => {
+    const members = fullResult.categories.filter((c) => group.categoryNames.includes(c.name));
+    const status = STATUS_PRIORITY.find((s) => members.some((m) => m.status === s)) ?? 'unable';
+    const evidence = Array.from(new Set(members.flatMap((m) => m.evidence))).slice(0, 6);
+    return { label: group.label, icon: group.icon, status, evidence };
+  }).filter((t) => t.evidence.length > 0 || t.status !== 'unable');
+}
+
+// --- Risk Signals: WHAT was found, grouped by severity ---
+const RISK_SIGNAL_GROUPS: { key: 'majorWarnings' | 'cautionSignals' | 'positiveSignals'; label: string; dot: string }[] = [
+  { key: 'majorWarnings', label: 'Major warnings', dot: 'bg-red-500' },
+  { key: 'cautionSignals', label: 'Caution signals', dot: 'bg-orange-400' },
+  { key: 'positiveSignals', label: 'Positive signals', dot: 'bg-emerald-500' },
+];
 
 function LockedFindingRow({ finding }: { finding: PublicFinding }) {
   const dot = finding.severity === 'critical' || finding.severity === 'high' ? 'bg-red-500' : 'bg-orange-400';
@@ -62,7 +97,7 @@ function LockedFindingRow({ finding }: { finding: PublicFinding }) {
   );
 }
 
-export default function Report({ publicResult, fullResult, input, onUnlocked }: ReportProps) {
+export default function Report({ publicResult, fullResult, input, onUnlocked, freeChecksRemaining }: ReportProps) {
   const [copied, setCopied] = useState<'share' | 'full' | null>(null);
   const [animateScore, setAnimateScore] = useState(false);
   const unlocked = fullResult !== null;
@@ -97,21 +132,75 @@ export default function Report({ publicResult, fullResult, input, onUnlocked }: 
   const extraLockedCount = publicResult.totalLockedFindingsCount - publicResult.lockedFindingTitles.length;
   const extraPositiveCount = publicResult.totalPositiveCount - (publicResult.positivePreview ? 1 : 0);
 
+  const opportunityAnalysis = fullResult ? buildOpportunityAnalysis(fullResult) : [];
+
   const gatedContent = fullResult && (
     <div className="space-y-6">
-      {groupFindingsBySubject(fullResult).map((group) => (
-        <section key={group.label}>
-          <h3 className="flex items-center gap-2 text-lg font-bold text-gray-900 mb-3">
-            <Search className="w-4 h-4 text-gray-400" />
-            {group.label}
-          </h3>
-          <div className="space-y-3">
-            {group.findings.map((f) => (
-              <FindingCard key={f.id} finding={f} defaultExpanded={f.severity === 'critical' || f.severity === 'high'} />
-            ))}
-          </div>
-        </section>
-      ))}
+      <section>
+        <h3 className="flex items-center gap-2 text-lg font-bold text-gray-900 mb-1">
+          <Search className="w-4 h-4 text-gray-400" />
+          Opportunity Analysis
+        </h3>
+        <p className="text-sm text-gray-500 mb-3">What was checked, by topic.</p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {opportunityAnalysis.map((topic) => {
+            const style = STATUS_STYLE[topic.status];
+            const TopicIcon = topic.icon;
+            const StatusIcon = style.icon;
+            return (
+              <div key={topic.label} className={`rounded-lg border ${style.border} ${style.bg} p-4`}>
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <span className="flex items-center gap-2 font-semibold text-gray-900 text-sm">
+                    <TopicIcon className="w-4 h-4 text-gray-500" />
+                    {topic.label}
+                  </span>
+                  <span className={`flex items-center gap-1 text-xs font-medium ${style.color}`}>
+                    <StatusIcon className="w-3.5 h-3.5" />
+                    {style.label}
+                  </span>
+                </div>
+                {topic.evidence.length > 0 && (
+                  <ul className="space-y-1">
+                    {topic.evidence.map((item, i) => (
+                      <li key={i} className="text-xs text-gray-600 flex items-start gap-1.5">
+                        <span className="w-1 h-1 rounded-full bg-gray-400 mt-1.5 flex-shrink-0" />
+                        {item}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      <section>
+        <h3 className="flex items-center gap-2 text-lg font-bold text-gray-900 mb-1">
+          <ShieldCheck className="w-4 h-4 text-gray-400" />
+          Risk Signals
+        </h3>
+        <p className="text-sm text-gray-500 mb-3">What was found, by severity, with the evidence behind it.</p>
+        <div className="space-y-5">
+          {RISK_SIGNAL_GROUPS.map((group) => {
+            const items = fullResult[group.key];
+            if (items.length === 0) return null;
+            return (
+              <div key={group.key}>
+                <h4 className="flex items-center gap-2 text-sm font-semibold text-gray-700 mb-2">
+                  <span className={`w-2.5 h-2.5 rounded-full ${group.dot}`} />
+                  {group.label} ({items.length})
+                </h4>
+                <div className="space-y-3">
+                  {items.map((f) => (
+                    <FindingCard key={f.id} finding={f} defaultExpanded={f.severity === 'critical' || f.severity === 'high'} />
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </section>
 
       <OpportunityQualityCard quality={fullResult.opportunityQuality} />
 
@@ -258,33 +347,42 @@ export default function Report({ publicResult, fullResult, input, onUnlocked }: 
         </section>
       )}
 
-      <section className="bg-white rounded-xl border border-gray-200 shadow-sm p-5 flex items-center justify-between gap-3">
-        <div>
-          <p className="text-sm font-semibold text-gray-900 mb-1">Category breakdown</p>
-          <p className="text-xs text-gray-500">
-            {publicResult.categoriesConcernCount} of {publicResult.categoriesTotalCount} categories raised real concerns
-          </p>
-        </div>
-        <div className="text-xs text-gray-400 flex items-center gap-1 flex-shrink-0">
-          <Lock className="w-3 h-3" />
-          Full breakdown locked
-        </div>
-      </section>
-
-      <section className={`rounded-lg border ${qualityStyle.border} ${qualityStyle.bg} p-5 flex items-center justify-between gap-3`}>
-        <div>
-          <p className="text-sm font-semibold text-gray-900 mb-1">Verification Completeness</p>
-          <span className={`inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white ${qualityStyle.color} text-sm font-semibold`}>
-            {publicResult.qualityRating}
-          </span>
-        </div>
-        <div className="text-right">
-          <p className="text-xs text-gray-500 flex items-center gap-1 justify-end">
+      {/* These two rows are pre-unlock teasers ("...locked"). Once unlocked,
+          the real Opportunity Analysis and Verification Completeness cards
+          render below inside gatedContent, so showing the locked teaser
+          alongside the unlocked content would be redundant and, worse,
+          would keep claiming something is locked that no longer is. */}
+      {!unlocked && (
+        <section className="bg-white rounded-xl border border-gray-200 shadow-sm p-5 flex items-center justify-between gap-3">
+          <div>
+            <p className="text-sm font-semibold text-gray-900 mb-1">Category breakdown</p>
+            <p className="text-xs text-gray-500">
+              {publicResult.categoriesConcernCount} of {publicResult.categoriesTotalCount} categories raised real concerns
+            </p>
+          </div>
+          <div className="text-xs text-gray-400 flex items-center gap-1 flex-shrink-0">
             <Lock className="w-3 h-3" />
-            {publicResult.qualityNotesLockedCount} note{publicResult.qualityNotesLockedCount !== 1 ? 's' : ''} locked
-          </p>
-        </div>
-      </section>
+            Full breakdown locked
+          </div>
+        </section>
+      )}
+
+      {!unlocked && (
+        <section className={`rounded-lg border ${qualityStyle.border} ${qualityStyle.bg} p-5 flex items-center justify-between gap-3`}>
+          <div>
+            <p className="text-sm font-semibold text-gray-900 mb-1">Verification Completeness</p>
+            <span className={`inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white ${qualityStyle.color} text-sm font-semibold`}>
+              {publicResult.qualityRating}
+            </span>
+          </div>
+          <div className="text-right">
+            <p className="text-xs text-gray-500 flex items-center gap-1 justify-end">
+              <Lock className="w-3 h-3" />
+              {publicResult.qualityNotesLockedCount} note{publicResult.qualityNotesLockedCount !== 1 ? 's' : ''} locked
+            </p>
+          </div>
+        </section>
+      )}
 
       <section className="bg-gray-900 rounded-xl p-6 text-center">
         <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wide mb-3">Bottom line</h3>
@@ -296,6 +394,22 @@ export default function Report({ publicResult, fullResult, input, onUnlocked }: 
           <p className="text-xs text-gray-500 mt-3">Unlock the full verification: evidence, category checks, and your recommended next step.</p>
         )}
       </section>
+
+      {unlocked && typeof freeChecksRemaining === 'number' && (
+        <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-200 rounded-lg px-4 py-3 text-sm text-emerald-800">
+          <ShieldCheck className="w-4 h-4 flex-shrink-0" />
+          <span>
+            This was a free check.{' '}
+            {freeChecksRemaining > 0
+              ? `${freeChecksRemaining} free check${freeChecksRemaining === 1 ? '' : 's'} left.`
+              : "That was your last free check — checks from here on unlock for ₹149 each."}
+          </span>
+        </div>
+      )}
+
+      {!unlocked && freeChecksRemaining === 0 && (
+        <p className="text-xs text-gray-500 -mb-2">You've used all 5 free checks. Need another verification?</p>
+      )}
 
       {unlocked ? gatedContent : <UnlockGate input={input} onUnlocked={onUnlocked} />}
 
