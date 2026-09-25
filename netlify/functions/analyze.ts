@@ -1,5 +1,5 @@
 import { analyzeOpportunity, toPublicResult } from '../../src/services/analyzer.js';
-import type { OpportunityInput, AnalyzeResponse } from '../../src/types/analysis.js';
+import type { OpportunityInput, AnalyzeResponse, PreviewTier } from '../../src/types/analysis.js';
 import { checkRateLimit, getClientIp } from '../../src/services/rateLimit.js';
 import { consumeFreeCheck } from '../../src/services/freeChecks.js';
 
@@ -10,9 +10,10 @@ const json = (data: unknown, status = 200, extraHeaders?: Record<string, string>
   });
 
 // This is the ONLY place the full analysis is computed for a fresh check.
-// The full result never leaves this function — only toPublicResult()'s
-// output is sent back. The full result is recomputed again, from scratch,
-// inside unlock.ts only after a real payment signature is verified.
+// The full result never leaves this function, free screening or not —
+// only toPublicResult()'s preview output is sent back. The full result is
+// recomputed again, from scratch, inside unlock.ts only after a real
+// payment signature is verified.
 export default async (req: Request): Promise<Response> => {
   if (req.method !== 'POST') {
     return json({ error: 'Method not allowed' }, 405);
@@ -63,16 +64,19 @@ export default async (req: Request): Promise<Response> => {
     }
 
     const fullResult = await analyzeOpportunity(safeInput);
-    const publicResult = toPublicResult(fullResult);
 
-    // 5 free checks, lifetime, per IP (best-effort — see freeChecks.ts).
-    // If one's available, hand back the full report right away instead of
-    // making them pay for a check they're entitled to for free.
+    // 5 free screenings, lifetime, per IP (best-effort — see
+    // freeChecks.ts). This only decides how rich the preview is — the
+    // richer 'standard' tier while free screenings remain, the smaller
+    // but still genuinely useful 'limited' tier once they're used up.
+    // Neither tier ever includes the full report; that only ever comes
+    // from /api/unlock after a verified payment.
     const freeCheck = consumeFreeCheck(ip);
+    const tier: PreviewTier = freeCheck.withinFreeTrial ? 'standard' : 'limited';
+    const publicResult = toPublicResult(fullResult, tier);
 
     const response: AnalyzeResponse = {
       publicResult,
-      fullResult: freeCheck.granted ? fullResult : null,
       freeChecksRemaining: freeCheck.remaining,
     };
 

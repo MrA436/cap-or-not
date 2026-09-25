@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import OpportunityForm from '@/components/OpportunityForm';
 import type { OpportunityInput, AnalyzeResponse } from '@/types/analysis';
-import { saveCheck, cacheFullResult } from '@/services/storage';
+import { saveCheck } from '@/services/storage';
 import { ShieldCheck } from 'lucide-react';
 
 export default function CheckPage() {
@@ -15,11 +15,10 @@ export default function CheckPage() {
     setError(null);
 
     try {
-      // The full analysis is computed server-side. It only comes back
-      // here if this caller still had a free check available (see
-      // api/analyze.ts + services/freeChecks.ts) — otherwise fullResult
-      // is null and the normal preview + pay-to-unlock flow takes over
-      // on the result page.
+      // The full analysis is computed server-side but never sent here —
+      // /api/analyze always returns just a preview (see api/analyze.ts +
+      // services/freeChecks.ts for which tier). The full report only
+      // arrives via the pay-to-unlock flow on the result page.
       const res = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -31,9 +30,8 @@ export default function CheckPage() {
         throw new Error(body?.error ?? 'Analysis failed');
       }
 
-      const { publicResult, fullResult, freeChecksRemaining }: AnalyzeResponse = await res.json();
+      const { publicResult, freeChecksRemaining }: AnalyzeResponse = await res.json();
       saveCheck(publicResult, input, freeChecksRemaining);
-      if (fullResult) cacheFullResult(publicResult.id, fullResult);
       navigate(`/result/${publicResult.id}`);
     } catch {
       setError('Something went wrong during analysis. Please try again.');

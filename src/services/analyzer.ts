@@ -8,6 +8,7 @@ import type {
   PublicAnalysisResult,
   VerificationConfidence,
   RecommendedActionPlan,
+  PreviewTier,
 } from '../types/analysis.js';
 import { lookupDomainAge } from './rdap.js';
 import { checkWebsiteReachable } from './websiteCheck.js';
@@ -1255,20 +1256,34 @@ function computeVerificationConfidence(categories: CategoryAnalysis[]): Verifica
  * the full AnalysisResult, but only after verifying a real Razorpay
  * signature server-side.
  */
-export function toPublicResult(result: AnalysisResult): PublicAnalysisResult {
-  const previewFinding = result.majorWarnings[0] ?? result.cautionSignals[0] ?? null;
-  const remainingMajor = previewFinding && result.majorWarnings[0] === previewFinding
-    ? result.majorWarnings.slice(1)
-    : result.majorWarnings;
-  const remainingCaution = previewFinding && result.cautionSignals[0] === previewFinding
-    ? result.cautionSignals.slice(1)
-    : result.cautionSignals;
-  const lockedFindings = [...remainingMajor, ...remainingCaution];
-  const criticalLockedCount = remainingMajor.filter((f) => f.severity === 'critical').length;
+/**
+ * Builds the preview sent to the browser before a payment is verified.
+ * Never includes the full report — the only difference between tiers is
+ * how much of the preview itself is shown:
+ *  - 'standard' (one of the 5 lifetime free screenings): one finding shown
+ *    in full (title, evidence, explanation, action), up to 2 more as
+ *    title-only, a positive-signal preview, the full verification-gap
+ *    list. This is the existing, richer preview.
+ *  - 'limited' (free-screening allowance used up): no finding is shown in
+ *    full — only up to 1 title-only finding — no positive-signal preview,
+ *    and the verification-gap list is trimmed. Risk level, risk score,
+ *    verification confidence, the summary, and the finding/gap counts are
+ *    still real and accurate in both tiers; 'limited' just shows fewer of
+ *    the details behind them.
+ */
+export function toPublicResult(result: AnalysisResult, tier: PreviewTier = 'standard'): PublicAnalysisResult {
+  const allNegativeFindings = [...result.majorWarnings, ...result.cautionSignals];
 
-  const positivePreview = result.positiveSignals[0]
+  const previewFinding = tier === 'standard' ? (allNegativeFindings[0] ?? null) : null;
+  const titleOnlyPool = tier === 'standard' ? allNegativeFindings.slice(1) : allNegativeFindings;
+  const maxTitleOnly = tier === 'standard' ? 2 : 1;
+  const criticalLockedCount = titleOnlyPool.filter((f) => f.severity === 'critical').length;
+
+  const positivePreview = tier === 'standard' && result.positiveSignals[0]
     ? { id: result.positiveSignals[0].id, title: result.positiveSignals[0].title, severity: result.positiveSignals[0].severity }
     : null;
+
+  const verificationGaps = tier === 'standard' ? result.verificationGaps : result.verificationGaps.slice(0, 1);
 
   const actionPreview = result.recommendedAction.bottomLine.slice(0, 70).trim();
 
@@ -1278,15 +1293,16 @@ export function toPublicResult(result: AnalysisResult): PublicAnalysisResult {
     riskLevel: result.riskLevel,
     verificationConfidence: result.verificationConfidence,
     summary: result.summary,
+    previewTier: tier,
     previewFinding,
-    lockedFindingTitles: lockedFindings.slice(0, 2).map((f) => ({ id: f.id, title: f.title, severity: f.severity })),
-    totalLockedFindingsCount: lockedFindings.length,
+    lockedFindingTitles: titleOnlyPool.slice(0, maxTitleOnly).map((f) => ({ id: f.id, title: f.title, severity: f.severity })),
+    totalLockedFindingsCount: titleOnlyPool.length,
     criticalLockedCount,
     majorWarningsCount: result.majorWarnings.length,
     cautionSignalsCount: result.cautionSignals.length,
     positivePreview,
     totalPositiveCount: result.positiveSignals.length,
-    verificationGaps: result.verificationGaps,
+    verificationGaps,
     categoriesTotalCount: result.categories.length,
     categoriesConcernCount: result.categories.filter((c) => c.status === 'suspicious' || c.riskLevel === 'high').length,
     qualityRating: result.opportunityQuality.rating,

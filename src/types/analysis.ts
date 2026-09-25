@@ -83,19 +83,25 @@ export interface PublicFinding {
   severity: Severity;
 }
 
+// 'standard' = one of the 5 lifetime free screenings — the richer preview
+// (one fully expanded finding, up to 2 more title-only findings, a
+// positive-signal preview, full verification-gap list). 'limited' = the
+// free-screening allowance is used up — a smaller preview (no expanded
+// finding, fewer title-only findings, no positive-signal preview, a
+// trimmed gap list), still genuinely informative, never the full report.
+// Neither tier ever includes the full report — that only ever comes from
+// /api/unlock after a verified payment. See toPublicResult() in
+// analyzer.ts for exactly what each tier includes.
+export type PreviewTier = 'standard' | 'limited';
+
 // This is the ONLY shape sent to the browser before a payment is verified.
 // It deliberately does not include the full Finding objects, the full
 // category evidence, or the full opportunityQuality notes — those only
-// exist server-side until /api/unlock confirms payment.
-// Response shape for POST /api/analyze. fullResult is only non-null when
-// the caller still had a free check available — see freeChecks.ts — in
-// which case the browser gets the complete report immediately, no
-// payment step. Once freeChecksRemaining has been 0 for a caller,
-// fullResult will be null here and the normal UnlockGate/payment flow
-// (publicResult -> /api/unlock) takes over, unchanged.
+// exist server-side until /api/unlock confirms payment. Response shape
+// for POST /api/analyze — always just the preview (see PreviewTier); the
+// full report is never returned here, free screening or not.
 export interface AnalyzeResponse {
   publicResult: PublicAnalysisResult;
-  fullResult: AnalysisResult | null;
   freeChecksRemaining: number;
 }
 
@@ -105,6 +111,7 @@ export interface PublicAnalysisResult {
   riskLevel: RiskLevel;
   verificationConfidence: VerificationConfidence;
   summary: string;
+  previewTier: PreviewTier;
   previewFinding: Finding | null;
   lockedFindingTitles: PublicFinding[];
   totalLockedFindingsCount: number;

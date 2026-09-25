@@ -291,10 +291,14 @@ export default function Report({ publicResult, fullResult, input, onUnlocked, fr
       {publicResult.totalLockedFindingsCount > 0 && (
         <section>
           <h3 className="text-lg font-bold text-gray-900 mb-1">
-            {publicResult.totalLockedFindingsCount} more finding{publicResult.totalLockedFindingsCount !== 1 ? 's' : ''}
+            {publicResult.totalLockedFindingsCount}{publicResult.previewTier === 'standard' ? ' more' : ''} finding{publicResult.totalLockedFindingsCount !== 1 ? 's' : ''}
             {publicResult.criticalLockedCount > 0 ? `, including ${publicResult.criticalLockedCount} critical` : ''}
           </h3>
-          <p className="text-sm text-gray-500 mb-3">A couple of headlines, free. The rest — plus the evidence and what to do — are in the full report.</p>
+          <p className="text-sm text-gray-500 mb-3">
+            {publicResult.previewTier === 'standard'
+              ? 'A couple of headlines, free. The rest — plus the evidence and what to do — are in the full report.'
+              : "This is a limited preview. The evidence and what to do about each finding are in the full report."}
+          </p>
           <div className="space-y-2">
             {publicResult.lockedFindingTitles.map((f) => (
               <LockedFindingRow key={f.id} finding={f} />
@@ -395,20 +399,17 @@ export default function Report({ publicResult, fullResult, input, onUnlocked, fr
         )}
       </section>
 
-      {unlocked && typeof freeChecksRemaining === 'number' && (
-        <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-200 rounded-lg px-4 py-3 text-sm text-emerald-800">
+      {!unlocked && typeof freeChecksRemaining === 'number' && (
+        <div className="flex items-center gap-2 bg-blue-50 border border-blue-200 rounded-lg px-4 py-3 text-sm text-blue-800">
           <ShieldCheck className="w-4 h-4 flex-shrink-0" />
           <span>
-            This was a free check.{' '}
-            {freeChecksRemaining > 0
-              ? `${freeChecksRemaining} free check${freeChecksRemaining === 1 ? '' : 's'} left.`
-              : "That was your last free check — checks from here on unlock for ₹149 each."}
+            {publicResult.previewTier === 'standard'
+              ? freeChecksRemaining > 0
+                ? `${freeChecksRemaining} free screening${freeChecksRemaining === 1 ? '' : 's'} remaining.`
+                : 'That was your last screening at this preview level. Future screenings still work, with a shorter preview — or unlock the full report for ₹199.'
+              : "You've used your 5 free screenings — this is a limited preview. Unlock the full report for ₹199."}
           </span>
         </div>
-      )}
-
-      {!unlocked && freeChecksRemaining === 0 && (
-        <p className="text-xs text-gray-500 -mb-2">You've used all 5 free checks. Need another verification?</p>
       )}
 
       {unlocked ? gatedContent : <UnlockGate input={input} onUnlocked={onUnlocked} />}

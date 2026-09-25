@@ -171,8 +171,8 @@ export const jobScamChecker: SEOContent = {
       ],
     },
     {
-      heading: 'Five free checks, no account required',
-      body: 'You get 5 free full reports for life, no account required — after that, unlocking a report is a small one-time payment per check. Each report includes a risk score, categorized findings, evidence from your input, verification gaps, and recommended actions. Reports can be copied or shared.',
+      heading: 'Five free screenings, no account required',
+      body: 'You get 5 free screenings for life, no account required. Every screening — free or not — shows your risk score, risk level, and a preview of what was found. The full verification report, with the complete evidence, category breakdown, and recommended actions, unlocks for a one-time ₹199 payment per report. Unlocked reports can be copied or shared.',
     },
   ],
 };

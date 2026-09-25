@@ -9,7 +9,7 @@ const json = (data: unknown, status = 200, extraHeaders?: Record<string, string>
 
 // Price lives here, server-side — never trust an amount sent from the
 // browser. Change this one line to change the price everywhere.
-const REPORT_PRICE_PAISE = 14900; // ₹149.00 (Razorpay amounts are in paise)
+const REPORT_PRICE_PAISE = 19900; // ₹199.00 (Razorpay amounts are in paise)
 
 export default async (req: Request): Promise<Response> => {
   if (req.method !== 'POST') {

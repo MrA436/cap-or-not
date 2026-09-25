@@ -1,7 +1,11 @@
-// Lifetime (not monthly) free-check allowance: the first FREE_CHECK_LIMIT
-// checks from a given IP get the full report automatically, no payment
-// step. After that, /api/analyze falls back to the normal preview +
-// pay-to-unlock flow.
+// Lifetime (not monthly) free-screening allowance: the first
+// FREE_CHECK_LIMIT screenings from a given IP get the richer 'standard'
+// preview tier (see PreviewTier in types/analysis.ts). After that, every
+// screening still works — it just falls back to the smaller 'limited'
+// preview tier. Neither tier ever includes the full report; the full
+// report only ever comes from /api/unlock after a verified payment. This
+// module only decides which preview tier a screening gets — it has no
+// say over report access.
 //
 // Same tradeoff as rateLimit.ts: this is an in-memory, per-function-
 // instance Map, not a real database. It genuinely stops the common case
@@ -17,7 +21,8 @@ const FREE_CHECK_LIMIT = 5;
 const freeCheckCounts = new Map<string, number>();
 
 export interface FreeCheckResult {
-  granted: boolean;
+  /** True if this screening still falls within the 5 lifetime free ones. */
+  withinFreeTrial: boolean;
   remaining: number;
 }
 
@@ -25,10 +30,10 @@ export interface FreeCheckResult {
 export function consumeFreeCheck(ip: string): FreeCheckResult {
   const used = freeCheckCounts.get(ip) ?? 0;
   if (used >= FREE_CHECK_LIMIT) {
-    return { granted: false, remaining: 0 };
+    return { withinFreeTrial: false, remaining: 0 };
   }
   freeCheckCounts.set(ip, used + 1);
-  return { granted: true, remaining: FREE_CHECK_LIMIT - (used + 1) };
+  return { withinFreeTrial: true, remaining: FREE_CHECK_LIMIT - (used + 1) };
 }
 
 /** Read-only peek, e.g. for showing "N free checks left" before submitting. */

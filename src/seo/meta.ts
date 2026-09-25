@@ -76,7 +76,7 @@ export function buildJsonLd(pathname: string): object | null {
         url: SITE_URL,
         applicationCategory: 'Utility',
         description: meta?.description,
-        offers: { '@type': 'Offer', price: '149', priceCurrency: 'INR' },
+        offers: { '@type': 'Offer', price: '199', priceCurrency: 'INR' },
       },
       {
         '@context': 'https://schema.org',
