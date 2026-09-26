@@ -34,8 +34,8 @@ export default function CheckPage() {
       const { publicResult, freeChecksRemaining }: AnalyzeResponse = await res.json();
       saveCheck(publicResult, input, freeChecksRemaining);
       navigate(`/result/${publicResult.id}`);
-    } catch {
-      setError('Something went wrong during analysis. Please try again.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Something went wrong during analysis. Please try again.');
     } finally {
       setIsAnalyzing(false);
     }

@@ -15,6 +15,23 @@ import { Pool } from 'pg';
 // connection pooler in front of Postgres (Supabase's built-in pgbouncer
 // endpoint, or Neon's own pooled connection string) instead of raising
 // this number — no code change needed here, just the connection string.
+/**
+ * Masks the password in a Postgres connection string for safe logging —
+ * everything except the password stays visible (host/port/user/database
+ * are not secret and are exactly what's useful for diagnosing a
+ * misconfigured DATABASE_URL, e.g. wrong host, wrong user, or a value
+ * that didn't save the way you expect in Netlify's env var UI).
+ */
+function redactConnectionString(connectionString: string): string {
+  try {
+    const url = new URL(connectionString);
+    if (url.password) url.password = '***';
+    return url.toString();
+  } catch {
+    return '(could not parse as a URL — check for stray quotes/whitespace, or that it starts with postgres:// or postgresql://)';
+  }
+}
+
 let pool: Pool | null = null;
 
 export function getPool(): Pool {
@@ -25,6 +42,13 @@ export function getPool(): Pool {
         'DATABASE_URL is not configured. Set it to a Postgres connection string (see netlify/functions/_lib/schema.sql for the tables it needs).',
       );
     }
+    // Logged once per cold start — deliberately redacted (see above) so
+    // this is safe to leave in and actually useful when a connection
+    // fails: it shows exactly what this running function is using,
+    // which is the only way to rule out "the value saved in Netlify
+    // isn't what I think it is" or "this deploy doesn't have the env var
+    // I just set" as the cause of an auth failure.
+    console.log('[db] connecting with', redactConnectionString(connectionString));
     // Deliberately not overriding SSL here — a managed Postgres
     // connection string (Neon, Supabase, Railway, etc.) already carries
     // whatever sslmode it needs as a query param, and `pg` respects
