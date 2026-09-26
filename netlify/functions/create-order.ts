@@ -1,5 +1,7 @@
 import Razorpay from 'razorpay';
 import { checkRateLimit, getClientIp } from '../../src/services/rateLimit.js';
+import { readUserIdCookie } from './_lib/identity.js';
+import { getReport, createPaymentOrder } from './_lib/store.js';
 
 const json = (data: unknown, status = 200, extraHeaders?: Record<string, string>) =>
   new Response(JSON.stringify(data), {
@@ -37,12 +39,44 @@ export default async (req: Request): Promise<Response> => {
   }
 
   try {
+    const body = (await req.json().catch(() => null)) as { reportId?: string } | null;
+    const reportId = body?.reportId;
+    if (!reportId) {
+      return json({ error: 'Missing reportId' }, 400);
+    }
+
+    // ₹199 unlocks ONE specific report, permanently, for the user who
+    // ran it — not unlimited future reports, and only for the person who
+    // ran it. That's enforced right here, before Razorpay is even
+    // involved: only the report's own owner (per the identity cookie —
+    // never trusted from anything the client sends explicitly) can
+    // start a purchase for it, and an already-paid report can't be
+    // "bought" again.
+    const userId = readUserIdCookie(req);
+    if (!userId) {
+      return json({ error: 'No screening found for this browser. Run a screening first.' }, 401);
+    }
+    const report = await getReport(reportId);
+    if (!report || report.userId !== userId) {
+      return json({ error: 'Report not found' }, 404);
+    }
+    if (report.paid) {
+      return json({ error: 'This report is already unlocked' }, 409);
+    }
+
     const razorpay = new Razorpay({ key_id: keyId, key_secret: keySecret });
 
     const order = await razorpay.orders.create({
       amount: REPORT_PRICE_PAISE,
       currency: 'INR',
       receipt: `capornot_${Date.now()}`,
+    });
+
+    await createPaymentOrder({
+      userId,
+      reportId,
+      razorpayOrderId: order.id,
+      amountPaise: REPORT_PRICE_PAISE,
     });
 
     // key_id is safe to return — it's the PUBLIC key, meant to be used in

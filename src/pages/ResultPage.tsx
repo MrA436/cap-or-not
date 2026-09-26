@@ -1,23 +1,68 @@
 import { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import Report from '@/components/Report';
-import type { AnalysisResult } from '@/types/analysis';
+import type { AnalysisResult, PublicAnalysisResult, OpportunityInput } from '@/types/analysis';
 import { getCheck, cacheFullResult } from '@/services/storage';
 import { ArrowLeft, FileX } from 'lucide-react';
 
+interface LoadedReport {
+  publicResult: PublicAnalysisResult;
+  input: OpportunityInput;
+  freeChecksRemaining?: number;
+}
+
 export default function ResultPage() {
   const { id } = useParams<{ id: string }>();
-  const [check, setCheck] = useState<ReturnType<typeof getCheck>>(null);
+  const [report, setReport] = useState<LoadedReport | null>(null);
   const [fullResult, setFullResult] = useState<AnalysisResult | null>(null);
   const [loading, setLoading] = useState(true);
+  const [notFound, setNotFound] = useState(false);
 
   useEffect(() => {
-    if (id) {
-      const item = getCheck(id);
-      setCheck(item);
-      setFullResult(item?.fullResult ?? null);
+    if (!id) {
+      setLoading(false);
+      return;
     }
-    setLoading(false);
+
+    // sessionStorage (from the moment CheckPage just created this report)
+    // renders instantly if present — no network round trip flash. It's
+    // just a local cache, though: the server is what actually decides
+    // ownership and paid status, so it's always asked too, and its
+    // answer wins once it arrives. This is what makes "leave and come
+    // back later, even on a fresh session" work — sessionStorage alone
+    // never would, since it doesn't survive that.
+    let cancelled = false;
+    const cached = getCheck(id);
+    if (cached) {
+      setReport({ publicResult: cached.publicResult, input: cached.input, freeChecksRemaining: cached.freeChecksRemaining });
+      setFullResult(cached.fullResult);
+      setLoading(false);
+    }
+
+    fetch(`/api/report?id=${encodeURIComponent(id)}`)
+      .then(async (res) => {
+        if (cancelled) return;
+        if (!res.ok) {
+          if (!cached) setNotFound(true);
+          return;
+        }
+        const data = await res.json();
+        setReport({ publicResult: data.publicResult, input: data.input, freeChecksRemaining: data.freeChecksRemaining });
+        setFullResult(data.fullResult ?? null);
+        setNotFound(false);
+      })
+      .catch(() => {
+        // Network hiccup — fall back to whatever sessionStorage had, if
+        // anything. Don't show "not found" just because the server call
+        // failed when we already have a local copy to show.
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
   }, [id]);
 
   // Called by UnlockGate once /api/unlock has verified a real payment and
@@ -36,7 +81,7 @@ export default function ResultPage() {
     );
   }
 
-  if (!check) {
+  if (!report || notFound) {
     return (
       <div className="max-w-2xl mx-auto px-4 py-16 text-center">
         <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-gray-100 mb-4">
@@ -64,11 +109,11 @@ export default function ResultPage() {
         New check
       </Link>
       <Report
-        publicResult={check.publicResult}
+        publicResult={report.publicResult}
         fullResult={fullResult}
-        input={check.input}
+        input={report.input}
         onUnlocked={handleUnlocked}
-        freeChecksRemaining={check.freeChecksRemaining}
+        freeChecksRemaining={report.freeChecksRemaining}
       />
     </div>
   );

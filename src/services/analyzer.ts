@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import type {
   Finding,
   CategoryResult,
@@ -1498,7 +1499,7 @@ export async function analyzeOpportunity(input: OpportunityInput): Promise<Analy
   }));
 
   return {
-    id: `check-${Date.now()}`,
+    id: randomUUID(),
     riskScore: score,
     riskLevel,
     verificationConfidence,

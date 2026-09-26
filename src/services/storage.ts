@@ -15,10 +15,16 @@ interface StoredCheck {
 
 /**
  * Only the PUBLIC (free-tier) result and the original input are ever
- * stored here — never the full analysis. The full analysis only exists
- * server-side (in /api/analyze and /api/unlock) until a real payment is
- * verified, at which point /api/unlock returns it and we cache it here
- * for the rest of this browser session only.
+ * stored here — never the full analysis, until a real payment is
+ * verified and cacheFullResult() below is called.
+ *
+ * This is a same-tab, same-session convenience cache ONLY — it's what
+ * lets CheckPage -> ResultPage navigate instantly without a network
+ * round trip. It is NOT how "leave and come back later" persistence
+ * works; sessionStorage is cleared when the browser/tab closes. That
+ * persistence is server-side (Postgres, keyed by the identity cookie —
+ * see netlify/functions/_lib/store.ts) and ResultPage always re-asks the
+ * server for the authoritative version regardless of what's cached here.
  */
 export function saveCheck(publicResult: PublicAnalysisResult, input: OpportunityInput, freeChecksRemaining?: number): void {
   try {
@@ -27,7 +33,8 @@ export function saveCheck(publicResult: PublicAnalysisResult, input: Opportunity
     all.unshift({ publicResult, input, fullResult: null, freeChecksRemaining });
     sessionStorage.setItem(CHECKS_KEY, JSON.stringify(all.slice(0, MAX_STORED)));
   } catch {
-    // storage unavailable — the result page will just show "not found"
+    // storage unavailable — ResultPage's server fetch still works fine
+    // without this; it's a pure latency optimization, not a dependency.
   }
 }
 

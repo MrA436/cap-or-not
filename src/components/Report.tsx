@@ -9,7 +9,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { useState, useEffect } from 'react';
-import { generateShareSummary, generateFullReport, copyToClipboard } from '@/services/share';
+import { generateShareSummary, generatePreviewShareSummary, generateFullReport, copyToClipboard } from '@/services/share';
 
 interface ReportProps {
   publicResult: PublicAnalysisResult;
@@ -108,8 +108,8 @@ export default function Report({ publicResult, fullResult, input, onUnlocked, fr
   }, []);
 
   const handleCopyShare = async () => {
-    if (!fullResult) return;
-    const success = await copyToClipboard(generateShareSummary(fullResult));
+    const summary = fullResult ? generateShareSummary(fullResult) : generatePreviewShareSummary(publicResult);
+    const success = await copyToClipboard(summary);
     if (success) {
       setCopied('share');
       setTimeout(() => setCopied(null), 2000);
@@ -225,22 +225,13 @@ export default function Report({ publicResult, fullResult, input, onUnlocked, fr
         </div>
       </section>
 
-      <div className="flex flex-col sm:flex-row gap-3">
-        <button
-          onClick={handleCopyShare}
-          className="flex-1 flex items-center justify-center gap-2 bg-white border border-gray-300 hover:border-gray-400 text-gray-700 font-medium py-3 rounded-lg transition-colors"
-        >
-          {copied === 'share' ? <CheckCircle2 className="w-4 h-4 text-emerald-500" /> : <Share2 className="w-4 h-4" />}
-          {copied === 'share' ? 'Copied!' : 'Share Result'}
-        </button>
-        <button
-          onClick={handleCopyFull}
-          className="flex-1 flex items-center justify-center gap-2 bg-white border border-gray-300 hover:border-gray-400 text-gray-700 font-medium py-3 rounded-lg transition-colors"
-        >
-          {copied === 'full' ? <CheckCircle2 className="w-4 h-4 text-emerald-500" /> : <Copy className="w-4 h-4" />}
-          {copied === 'full' ? 'Copied!' : 'Copy Report'}
-        </button>
-      </div>
+      <button
+        onClick={handleCopyFull}
+        className="w-full flex items-center justify-center gap-2 bg-white border border-gray-300 hover:border-gray-400 text-gray-700 font-medium py-3 rounded-lg transition-colors"
+      >
+        {copied === 'full' ? <CheckCircle2 className="w-4 h-4 text-emerald-500" /> : <Copy className="w-4 h-4" />}
+        {copied === 'full' ? 'Copied!' : 'Copy Report'}
+      </button>
     </div>
   );
 
@@ -412,7 +403,15 @@ export default function Report({ publicResult, fullResult, input, onUnlocked, fr
         </div>
       )}
 
-      {unlocked ? gatedContent : <UnlockGate input={input} onUnlocked={onUnlocked} />}
+      {unlocked ? gatedContent : <UnlockGate reportId={publicResult.id} onUnlocked={onUnlocked} />}
+
+      <button
+        onClick={handleCopyShare}
+        className="w-full flex items-center justify-center gap-2 bg-white border border-gray-300 hover:border-gray-400 text-gray-700 font-medium py-3 rounded-lg transition-colors"
+      >
+        {copied === 'share' ? <CheckCircle2 className="w-4 h-4 text-emerald-500" /> : <Share2 className="w-4 h-4" />}
+        {copied === 'share' ? 'Copied!' : 'Share Result'}
+      </button>
 
       <div className="flex items-center justify-center gap-2 text-xs text-gray-400">
         <Clock className="w-3 h-3" />

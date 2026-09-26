@@ -17,8 +17,9 @@ export default function CheckPage() {
     try {
       // The full analysis is computed server-side but never sent here —
       // /api/analyze always returns just a preview (see api/analyze.ts +
-      // services/freeChecks.ts for which tier). The full report only
-      // arrives via the pay-to-unlock flow on the result page.
+      // _lib/store.ts for which tier). The full report only arrives via
+      // the pay-to-unlock flow (or a later GET /api/report, once paid)
+      // on the result page.
       const res = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

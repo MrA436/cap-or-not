@@ -1,9 +1,9 @@
 import { useState } from 'react';
 import { Lock, ShieldCheck, Loader2 } from 'lucide-react';
-import type { OpportunityInput, AnalysisResult } from '@/types/analysis';
+import type { AnalysisResult } from '@/types/analysis';
 
 interface UnlockGateProps {
-  input: OpportunityInput;
+  reportId: string;
   onUnlocked: (fullResult: AnalysisResult) => void;
 }
 
@@ -37,7 +37,7 @@ function loadRazorpayScript(): Promise<void> {
  *     returns the full report.
  * The full report never exists in the browser before step 4 succeeds.
  */
-export default function UnlockGate({ input, onUnlocked }: UnlockGateProps) {
+export default function UnlockGate({ reportId, onUnlocked }: UnlockGateProps) {
   const [status, setStatus] = useState<'idle' | 'loading' | 'error'>('idle');
   const [errorMsg, setErrorMsg] = useState('');
   const [showCodeInput, setShowCodeInput] = useState(false);
@@ -51,7 +51,11 @@ export default function UnlockGate({ input, onUnlocked }: UnlockGateProps) {
     try {
       await loadRazorpayScript();
 
-      const orderRes = await fetch('/api/create-order', { method: 'POST' });
+      const orderRes = await fetch('/api/create-order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reportId }),
+      });
       if (!orderRes.ok) throw new Error('Could not start payment');
       const { orderId, amount, currency, keyId } = await orderRes.json();
 
@@ -72,7 +76,7 @@ export default function UnlockGate({ input, onUnlocked }: UnlockGateProps) {
             const unlockRes = await fetch('/api/unlock', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ ...response, input }),
+              body: JSON.stringify({ ...response, reportId }),
             });
             if (!unlockRes.ok) throw new Error('Payment could not be verified');
             const { fullResult } = await unlockRes.json();
@@ -102,7 +106,7 @@ export default function UnlockGate({ input, onUnlocked }: UnlockGateProps) {
       const res = await fetch('/api/unlock', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ testCode: code.trim(), input }),
+        body: JSON.stringify({ testCode: code.trim(), reportId }),
       });
       if (!res.ok) {
         const body = await res.json().catch(() => null);
