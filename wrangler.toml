@@ -1,0 +1,17 @@
+name = "cap-or-not"
+pages_build_output_dir = "./dist"
+
+# Set to today's date when you first deploy — Cloudflare recommends
+# keeping this current so you always opt into the latest runtime
+# behavior for new deploys. Once set, don't change it retroactively on a
+# whim; bumping it can change runtime behavior (that's the whole point of
+# it being a pinned date, not a version number).
+compatibility_date = "2026-09-27"
+
+# Required for pg (node-postgres) and node:crypto to work at all — this
+# is Cloudflare's Node.js compatibility layer for the Workers runtime.
+compatibility_flags = ["nodejs_compat"]
+
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "9057b35c786c4236b5d3fe496966535a"

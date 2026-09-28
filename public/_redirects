@@ -1,0 +1,7 @@
+# SPA fallback for client-side routing (React Router). Cloudflare Pages
+# checks for an actual static file match first (so the prerendered SEO
+# pages under scripts/prerender.mjs still get served directly), then
+# Pages Functions routes (so /api/* is already handled by functions/api/*
+# and never reaches this file at all) — this rule only catches what's
+# left: client-only routes like /result/:id.
+/*  /index.html  200

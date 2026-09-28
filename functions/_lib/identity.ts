@@ -38,9 +38,9 @@ export function newUserId(): string {
  *    thing item 5 asked for ("do not rely on frontend state").
  *  - Secure: HTTPS only. Modern browsers (Chrome, Firefox, Safari) special-
  *    case http://localhost as "potentially trustworthy" so this still
- *    works for local `netlify dev` — if you test over a plain-HTTP LAN
- *    IP instead of localhost, the cookie won't be set; use `netlify dev`
- *    on localhost or a real HTTPS deploy preview for that case.
+ *    works for local `wrangler pages dev` — if you test over a plain-HTTP
+ *    LAN IP instead of localhost, the cookie won't be set; use localhost
+ *    or a real HTTPS preview deploy for that case.
  *  - SameSite=Lax: sent on normal top-level navigation (e.g. returning
  *    from Razorpay Checkout) but withheld from cross-site requests
  *    forged from another site — the standard balance for this kind of

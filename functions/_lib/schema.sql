@@ -57,6 +57,19 @@ CREATE TABLE IF NOT EXISTS payments (
 );
 CREATE INDEX IF NOT EXISTS idx_payments_report_id ON payments (report_id);
 
+-- Lock these tables out of Supabase's auto-generated Data API (PostgREST/
+-- GraphQL, reachable with just the public anon key). Our own code never
+-- uses that API — it connects as the `postgres` role directly via
+-- DATABASE_URL, which owns these tables and bypasses RLS regardless of
+-- the setting below. This is purely to stop these tables being reachable
+-- by anyone with the anon key, since a table created via raw SQL (like
+-- this file) does NOT get RLS enabled automatically the way one made in
+-- the Table Editor does, and a fresh table can otherwise be exposed
+-- through that API by default. With RLS on and zero policies below, the
+-- Data API denies access to every row for anon/authenticated — a
+-- deliberate default-deny, not an oversight to fix later with policies.
+-- If you're certain your project's Data API is fully disabled (Project
+-- Settings > Data API), this is redundant but still harmless to leave on.
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE reports ENABLE ROW LEVEL SECURITY;
 ALTER TABLE payments ENABLE ROW LEVEL SECURITY;

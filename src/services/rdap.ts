@@ -64,7 +64,7 @@ async function getBootstrapServices(): Promise<Array<[string[], string[]]> | nul
       console.warn('[rdap] bootstrap fetch non-ok, status:', res.status);
       return null;
     }
-    const data = await res.json();
+    const data = (await res.json()) as { services?: unknown };
     const services = Array.isArray(data?.services) ? data.services : null;
     if (!services) {
       console.warn('[rdap] bootstrap response missing services array');
@@ -144,7 +144,7 @@ export async function lookupDomainAge(rawDomain: string): Promise<DomainAgeResul
         const res = await fetchWithTimeout(url, 6000);
 
         if (res.ok) {
-          const data = await res.json();
+          const data = (await res.json()) as unknown;
           const eventDate = parseRegistrationEvent(data);
           if (eventDate) {
             const ageDays = daysSince(eventDate);
@@ -178,7 +178,7 @@ export async function lookupDomainAge(rawDomain: string): Promise<DomainAgeResul
       return remember(unableToVerify);
     }
 
-    const data = await res.json();
+    const data = (await res.json()) as unknown;
     const eventDate = parseRegistrationEvent(data);
     if (!eventDate) {
       console.warn('[rdap] fallback had no registration event for', domain);

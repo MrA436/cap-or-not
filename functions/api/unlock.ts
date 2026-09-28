@@ -1,7 +1,9 @@
-import crypto from 'crypto';
+import crypto from 'node:crypto';
 import { checkRateLimit, getClientIp } from '../../src/services/rateLimit.js';
-import { readUserIdCookie } from './_lib/identity.js';
-import { getReport, getPaymentByOrderId, markPaymentPaid, markReportPaid } from './_lib/store.js';
+import { readUserIdCookie } from '../_lib/identity.js';
+import { openDbClient } from '../_lib/db.js';
+import { getReport, getPaymentByOrderId, markPaymentPaid, markReportPaid } from '../_lib/store.js';
+import type { Env } from '../_lib/types.js';
 
 const json = (data: unknown, status = 200, extraHeaders?: Record<string, string>) =>
   new Response(JSON.stringify(data), {
@@ -18,12 +20,8 @@ const json = (data: unknown, status = 200, extraHeaders?: Record<string, string>
 // report content itself comes from Postgres (what /api/analyze already
 // computed and stored), never recomputed from a client-resent copy of
 // the input.
-export default async (req: Request): Promise<Response> => {
-  if (req.method !== 'POST') {
-    return json({ error: 'Method not allowed' }, 405);
-  }
-
-  const ip = getClientIp(req);
+export const onRequestPost: PagesFunction<Env> = async ({ request, env, waitUntil }) => {
+  const ip = getClientIp(request);
   // More generous than the other endpoints — this is already gated by a
   // real signature check, so the limit here is just to stop someone
   // hammering it with junk requests, not to protect against bypass.
@@ -36,16 +34,19 @@ export default async (req: Request): Promise<Response> => {
     );
   }
 
-  const userId = readUserIdCookie(req);
+  const userId = readUserIdCookie(request);
   if (!userId) {
     return json({ error: 'No screening found for this browser. Run a screening first.' }, 401);
   }
 
-  const keySecret = process.env.RAZORPAY_KEY_SECRET;
-  const testUnlockCode = process.env.TEST_UNLOCK_CODE;
+  const keySecret = env.RAZORPAY_KEY_SECRET;
+  const testUnlockCode = env.TEST_UNLOCK_CODE;
+
+  const client = openDbClient(env.HYPERDRIVE);
+  await client.connect();
 
   try {
-    const body = (await req.json()) as {
+    const body = (await request.json()) as {
       razorpay_order_id?: string;
       razorpay_payment_id?: string;
       razorpay_signature?: string;
@@ -69,11 +70,11 @@ export default async (req: Request): Promise<Response> => {
       if (!reportId) {
         return json({ error: 'Missing reportId' }, 400);
       }
-      const report = await getReport(reportId);
+      const report = await getReport(client, reportId);
       if (!report || report.userId !== userId) {
         return json({ error: 'Report not found' }, 404);
       }
-      await markReportPaid(reportId);
+      await markReportPaid(client, reportId);
       return json({ fullResult: report.fullResult });
     }
 
@@ -87,7 +88,7 @@ export default async (req: Request): Promise<Response> => {
 
     // The order must be one we actually created for this user (see
     // create-order.ts) — not just any order id someone happens to send.
-    const payment = await getPaymentByOrderId(razorpay_order_id);
+    const payment = await getPaymentByOrderId(client, razorpay_order_id);
     if (!payment) {
       return json({ error: 'Payment could not be verified' }, 400);
     }
@@ -102,7 +103,7 @@ export default async (req: Request): Promise<Response> => {
     // more than once, or the browser retrying. Re-confirm rather than
     // error, and don't re-verify a signature we've already accepted.
     if (payment.status === 'paid') {
-      const report = await getReport(payment.reportId);
+      const report = await getReport(client, payment.reportId);
       if (!report) {
         return json({ error: 'Report not found' }, 404);
       }
@@ -135,17 +136,19 @@ export default async (req: Request): Promise<Response> => {
       return json({ error: 'Payment could not be verified' }, 400);
     }
 
-    const report = await getReport(payment.reportId);
+    const report = await getReport(client, payment.reportId);
     if (!report) {
       return json({ error: 'Report not found' }, 404);
     }
 
-    await markPaymentPaid(razorpay_order_id, razorpay_payment_id);
-    await markReportPaid(payment.reportId);
+    await markPaymentPaid(client, razorpay_order_id, razorpay_payment_id);
+    await markReportPaid(client, payment.reportId);
 
     return json({ fullResult: report.fullResult });
   } catch (err) {
     console.error('unlock error', err);
     return json({ error: 'Unlock failed' }, 500);
+  } finally {
+    waitUntil(client.end());
   }
 };

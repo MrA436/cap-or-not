@@ -1,7 +1,8 @@
-import Razorpay from 'razorpay';
 import { checkRateLimit, getClientIp } from '../../src/services/rateLimit.js';
-import { readUserIdCookie } from './_lib/identity.js';
-import { getReport, createPaymentOrder } from './_lib/store.js';
+import { readUserIdCookie } from '../_lib/identity.js';
+import { openDbClient } from '../_lib/db.js';
+import { getReport, createPaymentOrder } from '../_lib/store.js';
+import type { Env } from '../_lib/types.js';
 
 const json = (data: unknown, status = 200, extraHeaders?: Record<string, string>) =>
   new Response(JSON.stringify(data), {
@@ -13,12 +14,31 @@ const json = (data: unknown, status = 200, extraHeaders?: Record<string, string>
 // browser. Change this one line to change the price everywhere.
 const REPORT_PRICE_PAISE = 19900; // ₹199.00 (Razorpay amounts are in paise)
 
-export default async (req: Request): Promise<Response> => {
-  if (req.method !== 'POST') {
-    return json({ error: 'Method not allowed' }, 405);
+// Calls Razorpay's Orders API directly via fetch rather than the
+// `razorpay` npm package. That package depends on axios, whose Node
+// HTTP-adapter path isn't guaranteed to work under Cloudflare Workers'
+// nodejs_compat — fetch is a first-class, fully-native Workers API with
+// no such uncertainty, and Razorpay's API is a plain REST endpoint
+// (Basic Auth with key_id:key_secret) with nothing the SDK does that
+// fetch can't do directly. See https://razorpay.com/docs/api/orders/create
+async function createRazorpayOrder(keyId: string, keySecret: string, body: Record<string, unknown>) {
+  const res = await fetch('https://api.razorpay.com/v1/orders', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Basic ${btoa(`${keyId}:${keySecret}`)}`,
+    },
+    body: JSON.stringify(body),
+  });
+  const data = (await res.json()) as { id?: string; amount?: number; currency?: string; error?: { description?: string } };
+  if (!res.ok || !data.id) {
+    throw new Error(data.error?.description ?? `Razorpay order creation failed (${res.status})`);
   }
+  return data as { id: string; amount: number; currency: string };
+}
 
-  const ip = getClientIp(req);
+export const onRequestPost: PagesFunction<Env> = async ({ request, env, waitUntil }) => {
+  const ip = getClientIp(request);
   // Stricter than analyze — each call here is a real API request to
   // Razorpay, not just local computation.
   const rateLimit = checkRateLimit(`create-order:${ip}`, 5, 60_000); // 5/minute/IP
@@ -30,16 +50,19 @@ export default async (req: Request): Promise<Response> => {
     );
   }
 
-  const keyId = process.env.RAZORPAY_KEY_ID;
-  const keySecret = process.env.RAZORPAY_KEY_SECRET;
+  const keyId = env.RAZORPAY_KEY_ID;
+  const keySecret = env.RAZORPAY_KEY_SECRET;
 
   if (!keyId || !keySecret) {
     console.error('Razorpay keys are not configured');
     return json({ error: 'Payments are not configured' }, 500);
   }
 
+  const client = openDbClient(env.HYPERDRIVE);
+  await client.connect();
+
   try {
-    const body = (await req.json().catch(() => null)) as { reportId?: string } | null;
+    const body = (await request.json().catch(() => null)) as { reportId?: string } | null;
     const reportId = body?.reportId;
     if (!reportId) {
       return json({ error: 'Missing reportId' }, 400);
@@ -52,11 +75,11 @@ export default async (req: Request): Promise<Response> => {
     // never trusted from anything the client sends explicitly) can
     // start a purchase for it, and an already-paid report can't be
     // "bought" again.
-    const userId = readUserIdCookie(req);
+    const userId = readUserIdCookie(request);
     if (!userId) {
       return json({ error: 'No screening found for this browser. Run a screening first.' }, 401);
     }
-    const report = await getReport(reportId);
+    const report = await getReport(client, reportId);
     if (!report || report.userId !== userId) {
       return json({ error: 'Report not found' }, 404);
     }
@@ -64,15 +87,13 @@ export default async (req: Request): Promise<Response> => {
       return json({ error: 'This report is already unlocked' }, 409);
     }
 
-    const razorpay = new Razorpay({ key_id: keyId, key_secret: keySecret });
-
-    const order = await razorpay.orders.create({
+    const order = await createRazorpayOrder(keyId, keySecret, {
       amount: REPORT_PRICE_PAISE,
       currency: 'INR',
       receipt: `capornot_${Date.now()}`,
     });
 
-    await createPaymentOrder({
+    await createPaymentOrder(client, {
       userId,
       reportId,
       razorpayOrderId: order.id,
@@ -90,5 +111,7 @@ export default async (req: Request): Promise<Response> => {
   } catch (err) {
     console.error('create-order error', err);
     return json({ error: 'Could not create order' }, 500);
+  } finally {
+    waitUntil(client.end());
   }
 };

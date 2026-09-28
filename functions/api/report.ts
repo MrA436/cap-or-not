@@ -1,8 +1,10 @@
 import { toPublicResult } from '../../src/services/analyzer.js';
 import type { AnalyzeResponse, AnalysisResult, OpportunityInput } from '../../src/types/analysis.js';
 import { checkRateLimit, getClientIp } from '../../src/services/rateLimit.js';
-import { readUserIdCookie } from './_lib/identity.js';
-import { getReport, getFreeChecksRemaining } from './_lib/store.js';
+import { readUserIdCookie } from '../_lib/identity.js';
+import { openDbClient } from '../_lib/db.js';
+import { getReport, getFreeChecksRemaining } from '../_lib/store.js';
+import type { Env } from '../_lib/types.js';
 
 const json = (data: unknown, status = 200, extraHeaders?: Record<string, string>) =>
   new Response(JSON.stringify(data), {
@@ -23,12 +25,8 @@ export interface GetReportResponse extends AnalyzeResponse {
 // than the one asking is treated exactly like a nonexistent one — same
 // response either way — so this endpoint can't be used to find out
 // whether some other report id exists, let alone read anything about it.
-export default async (req: Request): Promise<Response> => {
-  if (req.method !== 'GET') {
-    return json({ error: 'Method not allowed' }, 405);
-  }
-
-  const ip = getClientIp(req);
+export const onRequestGet: PagesFunction<Env> = async ({ request, env, waitUntil }) => {
+  const ip = getClientIp(request);
   const rateLimit = checkRateLimit(`report:${ip}`, 30, 60_000); // 30/minute/IP
   if (!rateLimit.allowed) {
     return json(
@@ -38,20 +36,23 @@ export default async (req: Request): Promise<Response> => {
     );
   }
 
-  const id = new URL(req.url).searchParams.get('id');
+  const id = new URL(request.url).searchParams.get('id');
   if (!id) {
     return json({ error: 'Missing id' }, 400);
   }
 
-  const userId = readUserIdCookie(req);
+  const userId = readUserIdCookie(request);
+
+  const client = openDbClient(env.HYPERDRIVE);
+  await client.connect();
 
   try {
-    const report = userId ? await getReport(id) : null;
+    const report = userId ? await getReport(client, id) : null;
     if (!report || report.userId !== userId) {
       return json({ error: 'Report not found' }, 404);
     }
 
-    const freeChecksRemaining = await getFreeChecksRemaining(userId as string);
+    const freeChecksRemaining = await getFreeChecksRemaining(client, userId as string);
     const publicResult = toPublicResult(report.fullResult, report.previewTier);
 
     const response: GetReportResponse = {
@@ -65,5 +66,7 @@ export default async (req: Request): Promise<Response> => {
   } catch (err) {
     console.error('report error', err);
     return json({ error: 'Could not load report' }, 500);
+  } finally {
+    waitUntil(client.end());
   }
 };

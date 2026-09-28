@@ -1,14 +1,14 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
-    "module": "commonjs",
-    "moduleResolution": "node",
+    "target": "ES2021",
+    "module": "es2022",
+    "moduleResolution": "bundler",
     "esModuleInterop": true,
     "skipLibCheck": true,
     "strict": true,
     "noEmit": true,
     "resolveJsonModule": true,
-    "types": ["node"]
+    "types": ["@cloudflare/workers-types"]
   },
-  "include": ["netlify/functions/**/*.ts", "src/types/analysis.ts", "src/services/analyzer.ts", "src/services/rdap.ts", "src/services/rateLimit.ts", "src/services/websiteCheck.ts"]
+  "include": ["functions/**/*.ts", "src/types/analysis.ts", "src/services/analyzer.ts", "src/services/rdap.ts", "src/services/rateLimit.ts", "src/services/websiteCheck.ts"]
 }

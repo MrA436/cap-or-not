@@ -1,8 +1,10 @@
 import { analyzeOpportunity, toPublicResult } from '../../src/services/analyzer.js';
 import type { OpportunityInput, AnalyzeResponse, PreviewTier } from '../../src/types/analysis.js';
 import { checkRateLimit, getClientIp } from '../../src/services/rateLimit.js';
-import { resolveUserId, userIdSetCookieHeader } from './_lib/identity.js';
-import { ensureUser, consumeFreeCheck, saveReport } from './_lib/store.js';
+import { resolveUserId, userIdSetCookieHeader } from '../_lib/identity.js';
+import { openDbClient } from '../_lib/db.js';
+import { ensureUser, consumeFreeCheck, saveReport } from '../_lib/store.js';
+import type { Env } from '../_lib/types.js';
 
 const json = (data: unknown, status = 200, extraHeaders?: Record<string, string>) =>
   new Response(JSON.stringify(data), {
@@ -18,12 +20,12 @@ const json = (data: unknown, status = 200, extraHeaders?: Record<string, string>
 // trusting a client-resent copy of the input. The full result is only
 // ever sent to the browser from report.ts/unlock.ts, and only once
 // reports.paid is true for that report.
-export default async (req: Request): Promise<Response> => {
-  if (req.method !== 'POST') {
-    return json({ error: 'Method not allowed' }, 405);
-  }
-
-  const ip = getClientIp(req);
+//
+// Exporting only onRequestPost (no onRequestGet etc.) means Cloudflare
+// Pages itself returns 405 for any other method to /api/analyze — no
+// manual method check needed, unlike the old Netlify version.
+export const onRequestPost: PagesFunction<Env> = async ({ request, env, waitUntil }) => {
+  const ip = getClientIp(request);
   const rateLimit = checkRateLimit(`analyze:${ip}`, 10, 60_000); // 10 checks/minute/IP
   if (!rateLimit.allowed) {
     return json(
@@ -33,8 +35,11 @@ export default async (req: Request): Promise<Response> => {
     );
   }
 
+  const client = openDbClient(env.HYPERDRIVE);
+  await client.connect();
+
   try {
-    const input = (await req.json()) as Partial<OpportunityInput>;
+    const input = (await request.json()) as Partial<OpportunityInput>;
 
     if (!input || typeof input !== 'object') {
       return json({ error: 'Invalid request body' }, 400);
@@ -71,8 +76,8 @@ export default async (req: Request): Promise<Response> => {
     // not anything the frontend can read or set (see _lib/identity.ts).
     // This is what lets someone leave and come back later to the same
     // report/free-check allowance, on this browser, without an account.
-    const { userId } = resolveUserId(req);
-    await ensureUser(userId);
+    const { userId } = resolveUserId(request);
+    await ensureUser(client, userId);
 
     const fullResult = await analyzeOpportunity(safeInput);
 
@@ -83,11 +88,11 @@ export default async (req: Request): Promise<Response> => {
     // used up. Neither tier ever includes the full report; that only
     // ever comes from /api/report or /api/unlock once reports.paid is
     // true for this specific report.
-    const freeCheck = await consumeFreeCheck(userId);
+    const freeCheck = await consumeFreeCheck(client, userId);
     const tier: PreviewTier = freeCheck.withinFreeTrial ? 'standard' : 'limited';
     const publicResult = toPublicResult(fullResult, tier);
 
-    await saveReport({
+    await saveReport(client, {
       id: publicResult.id,
       userId,
       input: safeInput,
@@ -106,5 +111,11 @@ export default async (req: Request): Promise<Response> => {
   } catch (err) {
     console.error('analyze error', err);
     return json({ error: 'Analysis failed' }, 500);
+  } finally {
+    // Close the connection in the background rather than making the
+    // response wait for it — Hyperdrive's own pool is what actually
+    // stays warm between requests, this is just this one request's
+    // handle to it.
+    waitUntil(client.end());
   }
 };

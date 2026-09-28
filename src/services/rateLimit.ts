@@ -3,14 +3,15 @@ interface RateLimitEntry {
   resetAt: number;
 }
 
-// In-memory, per-function-instance. Netlify Functions run on Lambda, which
-// stays warm between requests for a while, so this genuinely throttles a
-// burst of rapid requests from the same source — it just doesn't persist
-// across cold starts or share state between multiple warm instances. Same
+// In-memory, per-isolate. Cloudflare Workers isolates stay warm between
+// requests for a while, so this genuinely throttles a burst of rapid
+// requests from the same source — it just doesn't persist across a cold
+// start or share state between multiple concurrent isolates. Same
 // "best-effort, not a distributed system" tradeoff as the RDAP cache.
 // Good enough to stop casual abuse of a micro tool; a real attacker with
-// many IPs would need a proper distributed limiter (Netlify Rate Limiting,
-// Upstash Redis, etc.) — worth upgrading only if this stops being enough.
+// many IPs would need a proper distributed limiter (Cloudflare Rate
+// Limiting rules, Durable Objects, Upstash Redis, etc.) — worth
+// upgrading only if this stops being enough.
 const buckets = new Map<string, RateLimitEntry>();
 
 export interface RateLimitResult {
@@ -36,14 +37,16 @@ export function checkRateLimit(key: string, maxRequests: number, windowMs: numbe
 }
 
 /**
- * Netlify forwards the real client IP through these headers. Falls back
- * to a constant if neither is present (e.g. some local/dev invocations),
- * which just means everyone shares one bucket in that edge case rather
- * than the limiter throwing.
+ * Cloudflare sets CF-Connecting-IP on every request at its edge — this is
+ * the reliable one, not spoofable by the client (Cloudflare overwrites
+ * it). Falls back to x-forwarded-for, then a constant, for local dev
+ * (`wrangler pages dev`) where CF-Connecting-IP isn't set — that just
+ * means everyone shares one bucket in that case rather than the limiter
+ * throwing.
  */
 export function getClientIp(req: Request): string {
-  const nfIp = req.headers.get('x-nf-client-connection-ip');
-  if (nfIp) return nfIp;
+  const cfIp = req.headers.get('cf-connecting-ip');
+  if (cfIp) return cfIp;
   const forwarded = req.headers.get('x-forwarded-for');
   if (forwarded) return forwarded.split(',')[0].trim();
   return 'unknown';

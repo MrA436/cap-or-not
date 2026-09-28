@@ -23,4 +23,5 @@ dist-ssr
 .env
 .vercel
 .netlify
-CAPORNOT_CHECKLIST.md
+.dev.vars
+.wrangler
