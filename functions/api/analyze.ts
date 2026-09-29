@@ -79,7 +79,7 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env, waitUnti
     const { userId } = resolveUserId(request);
     await ensureUser(client, userId);
 
-    const fullResult = await analyzeOpportunity(safeInput);
+    const fullResult = await analyzeOpportunity(safeInput, { llmApiKey: env.LLM_API_KEY });
 
     // 5 free screenings, lifetime, per persistent user id (not per IP —
     // see _lib/store.ts). This only decides how rich the preview is —

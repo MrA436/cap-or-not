@@ -7,4 +7,11 @@ export interface Env {
   RAZORPAY_KEY_ID: string;
   RAZORPAY_KEY_SECRET: string;
   TEST_UNLOCK_CODE?: string;
+  // Optional — the LLM extraction layer (src/services/llmExtract.ts) is a
+  // pure enhancement. When unset, analysis falls back to the deterministic
+  // extractors and nothing else changes. Provider-agnostic name: whichever
+  // LLM API llmExtract.ts is wired up to at the time (currently written
+  // for Anthropic's request/response shape — see the note at the top of
+  // that file if switching providers).
+  LLM_API_KEY?: string;
 }

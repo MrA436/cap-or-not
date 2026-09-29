@@ -15,6 +15,7 @@ import type {
 import { lookupDomainAge } from './rdap.js';
 import { checkWebsiteReachable } from './websiteCheck.js';
 import { inferRecruiterName } from './extract.js';
+import { extractWithLlm } from './llmExtract.js';
 
 function getDomainFromUrl(url: string): string | null {
   try {
@@ -1547,41 +1548,73 @@ async function applyWebsiteReachabilitySignal(input: OpportunityInput, companyCa
   });
 }
 
-export async function analyzeOpportunity(input: OpportunityInput): Promise<AnalysisResult> {
+export interface AnalyzeOptions {
+  /**
+   * Enables the LLM extraction layer as a fallback for whatever the fast,
+   * free, deterministic extractors in extract.ts couldn't find (e.g. a
+   * recruiter name mentioned in prose rather than a labelled "Recruiter:"
+   * line). Deterministic extraction always runs first and always wins if
+   * it succeeds — the LLM is only consulted for a field still missing
+   * afterward. If omitted, undefined, or the call fails for any reason,
+   * behavior is identical to not having this layer at all.
+   */
+  llmApiKey?: string;
+}
+
+export async function analyzeOpportunity(input: OpportunityInput, options: AnalyzeOptions = {}): Promise<AnalysisResult> {
   findingCounter = 0;
 
   let effectiveInput = input;
   let inferredCompanyFinding: Finding | null = null;
+  let recruiterNameExtracted = false;
 
-  if (!input.company.trim()) {
-    const combinedText = `${input.recruiterMessage} ${input.description} ${input.offerLetter}`;
-    const inferred = inferCompanyName(combinedText) ?? inferCompanyNameFromWebsite(input.companyWebsite);
-    if (inferred) {
-      effectiveInput = { ...input, company: inferred };
-      inferredCompanyFinding = {
-        id: nextId(),
-        category: 'company',
-        severity: 'positive',
-        title: `Company identified: "${inferred}"`,
-        finding: `A company name was not explicitly entered, but "${inferred}" was identified from the submitted text${input.companyWebsite.trim() ? ' or website' : ''}.`,
-        evidence: inferred,
-        explanation: 'This is a best-effort extraction, not a manual entry — worth double-checking it matches the actual company before relying on it.',
-        action: 'Confirm this is the correct company name.',
-      };
+  const combinedText = `${input.recruiterMessage}\n${input.description}\n${input.offerLetter}`;
+
+  // Deterministic pass first — free, instant, already tested (see
+  // scripts/test-extract.mts). The LLM is only ever consulted for
+  // whichever of these two fields is STILL missing afterward.
+  let inferredCompany = !input.company.trim()
+    ? (inferCompanyName(combinedText) ?? inferCompanyNameFromWebsite(input.companyWebsite))
+    : null;
+  let inferredRecruiterName = !input.recruiterName.trim()
+    ? inferRecruiterName(combinedText)
+    : null;
+
+  let companySource: 'llm' | 'deterministic' = 'deterministic';
+  const stillNeedsCompany = !input.company.trim() && !inferredCompany;
+  const stillNeedsRecruiterName = !input.recruiterName.trim() && !inferredRecruiterName;
+  if (options.llmApiKey && (stillNeedsCompany || stillNeedsRecruiterName)) {
+    const llmResult = await extractWithLlm(combinedText, options.llmApiKey);
+    if (llmResult.usedLlm) {
+      if (stillNeedsCompany && llmResult.company) {
+        inferredCompany = llmResult.company;
+        companySource = 'llm';
+      }
+      if (stillNeedsRecruiterName && llmResult.recruiterName) {
+        inferredRecruiterName = llmResult.recruiterName;
+      }
     }
   }
 
-  // Recruiter name: if the form field is empty but the pasted text has a
-  // labelled "Recruiter: <Name>" line, use it. Extraction failure just leaves
-  // the honest "not provided" gap in place.
-  let recruiterNameExtracted = false;
-  if (!effectiveInput.recruiterName.trim()) {
-    const combinedText = `${input.recruiterMessage}\n${input.description}\n${input.offerLetter}`;
-    const name = inferRecruiterName(combinedText);
-    if (name) {
-      effectiveInput = { ...effectiveInput, recruiterName: name };
-      recruiterNameExtracted = true;
-    }
+  if (inferredCompany) {
+    effectiveInput = { ...effectiveInput, company: inferredCompany };
+    inferredCompanyFinding = {
+      id: nextId(),
+      category: 'company',
+      severity: 'positive',
+      title: `Company identified: "${inferredCompany}"`,
+      finding: `A company name was not explicitly entered, but "${inferredCompany}" was identified from the submitted text${input.companyWebsite.trim() ? ' or website' : ''}.`,
+      evidence: inferredCompany,
+      explanation: companySource === 'llm'
+        ? 'This was extracted by an AI reading pass, not a manual entry — worth double-checking it matches the actual company before relying on it.'
+        : 'This is a best-effort extraction, not a manual entry — worth double-checking it matches the actual company before relying on it.',
+      action: 'Confirm this is the correct company name.',
+    };
+  }
+
+  if (inferredRecruiterName) {
+    effectiveInput = { ...effectiveInput, recruiterName: inferredRecruiterName };
+    recruiterNameExtracted = true;
   }
 
   const companyCategory = analyzeCompany(effectiveInput);
