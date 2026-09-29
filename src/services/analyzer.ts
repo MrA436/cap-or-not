@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type {
   Finding,
+  Severity,
   CategoryResult,
   AnalysisResult,
   OpportunityInput,
@@ -139,12 +140,40 @@ const GOVERNMENT_KEYWORDS = [
   'government internship', 'govt internship', 'niti aayog',
 ];
 
-const SENSITIVE_INFO_KEYWORDS = [
-  'aadhaar', 'pan card', 'ssn', 'social security', 'passport',
-  'bank account', 'bank details', 'banking details', 'credit card',
-  'debit card', 'identity proof', 'id proof', 'photograph',
-  'driving license', 'voter id', 'ration card',
-];
+// Sensitive-info detection is split by WHAT is being asked for, because a
+// passport-size photograph and an Aadhaar number are not the same category
+// of risk. Each keyword maps to exactly one bucket so a single mention isn't
+// double-counted across buckets.
+type SensitiveInfoBucket = 'governmentId' | 'financial' | 'photograph';
+
+const SENSITIVE_INFO_KEYWORD_MAP: Record<SensitiveInfoBucket, string[]> = {
+  // Government-issued identity documents / numbers.
+  governmentId: [
+    'aadhaar', 'aadhar', 'pan card', 'pan number', 'ssn', 'social security',
+    'passport number', 'passport copy', 'copy of your passport',
+    'driving license', "driver's license", 'voter id', 'voter card',
+    'ration card',
+  ],
+  // Financial account access — distinct from a government ID.
+  financial: [
+    'bank account', 'bank details', 'banking details', 'account number',
+    'ifsc', 'credit card', 'debit card', 'card number', 'cvv',
+    'net banking', 'upi pin', 'atm pin',
+  ],
+  // A photograph alone is asked for in plenty of legitimate hiring flows
+  // (ID badges, LinkedIn-style profile photos). It is not government-ID-level
+  // sensitive on its own, so it is scored separately and lower.
+  photograph: [
+    'passport-size photograph', 'passport size photograph',
+    'passport photo', 'photograph', 'photo id',
+  ],
+};
+
+// Generic phrases that mean "some form of ID" without saying which. Only
+// used to raise confidence when nothing more specific matched — never
+// counted alongside a specific document, to avoid double-counting the same
+// request under two labels.
+const GENERIC_ID_PHRASES = ['identity proof', 'id proof', 'government id', 'govt id'];
 
 let findingCounter = 0;
 function nextId(): string {
@@ -216,6 +245,46 @@ function detectLookalikeDomain(emailDomain: string, companyDomain: string): bool
 
 function isSubdomain(domain: string, rootDomain: string): boolean {
   return domain !== rootDomain && domain.endsWith(`.${rootDomain}`);
+}
+
+/**
+ * Overall score: driven by evidence SEVERITY, not by how many correlated
+ * signals happened to fire.
+ *
+ * The old model summed every category's scoreContribution with arbitrary
+ * per-finding weights, capped at 100. That let four weak, correlated signals
+ * (Gmail, WhatsApp, urgency language, no interview mentioned) add up to
+ * roughly the same score as one explicit upfront-payment demand — even
+ * though those four often co-occur as symptoms of the SAME underlying
+ * situation (an informal, fast-moving process) rather than being four
+ * independent pieces of evidence.
+ *
+ * This model instead takes a base score from the single strongest finding's
+ * severity, then adds a small, capped "corroboration" amount for everything
+ * else. A pile of caution-level signals can nudge the score up a little; it
+ * can never manufacture a 100 on its own, and it can never drown out what a
+ * genuine critical-severity finding (an explicit payment demand, a
+ * government ID request, a lookalike domain) should mean on its own.
+ */
+const SEVERITY_RANK: Record<Severity, number> = { critical: 4, high: 3, caution: 2, low: 1, positive: 0 };
+// Score attributable to the single strongest finding present.
+const SEVERITY_BASE_SCORE: Record<Severity, number> = { critical: 65, high: 40, caution: 18, low: 6, positive: 0 };
+// Additional score per OTHER (non-strongest) finding, by its own severity.
+const SEVERITY_UPLIFT: Record<Severity, number> = { critical: 12, high: 6, caution: 2, low: 1, positive: 0 };
+// However many corroborating signals pile up, they can't add more than this.
+const CORROBORATION_CAP = 25;
+
+function computeOverallScore(allFindings: Finding[]): number {
+  const negative = allFindings.filter((f) => f.severity !== 'positive');
+  if (negative.length === 0) return 0;
+
+  const sorted = [...negative].sort((a, b) => SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity]);
+  const base = SEVERITY_BASE_SCORE[sorted[0].severity];
+  const uplift = Math.min(
+    CORROBORATION_CAP,
+    sorted.slice(1).reduce((sum, f) => sum + SEVERITY_UPLIFT[f.severity], 0),
+  );
+  return Math.min(100, Math.round(base + uplift));
 }
 
 const RISK_LEVEL_ORDER: RiskLevel[] = ['LOW RISK', 'GENERALLY LOW RISK', 'CAUTION', 'HIGH RISK', 'VERY HIGH RISK'];
@@ -465,31 +534,26 @@ function analyzeEmailDomain(input: OpportunityInput): CategoryAnalysis {
   }
 
   if (FREE_EMAIL_PROVIDERS.has(emailDomain)) {
+    // Single finding either way — a free provider plus "it also isn't the
+    // company's domain" are the same underlying fact (the recruiter's
+    // affiliation is unverified), not two separate pieces of evidence. This
+    // is about identity verification, not a domain-mismatch/fraud claim, so
+    // it stays at "caution" rather than "high" and the wording says exactly
+    // that: unverified, not incriminating.
+    const alsoDiffersFromWebsite = !!websiteDomain && websiteDomain !== emailDomain;
     findings.push({
       id: nextId(),
       category: 'email',
       severity: 'caution',
-      title: `Recruiter email is on ${emailDomain}, a free provider`,
-      finding: `The recruiter email uses a free email provider (${emailDomain}).`,
-      evidence: input.recruiterEmail,
-      explanation: 'This is not proof of fraud — many legitimate third-party recruiters use Gmail. However, if the recruiter claims to represent a specific company, the email should ideally come from that company\'s domain.',
-      action: 'If the recruiter claims to represent a company, verify using the company\'s official email domain.',
+      title: 'Recruiter uses a free email provider',
+      finding: alsoDiffersFromWebsite
+        ? `The recruiter uses ${emailDomain} rather than an address on ${input.company || 'the company'}'s own domain (${websiteDomain}).`
+        : `The recruiter email uses a free email provider (${emailDomain}).`,
+      evidence: alsoDiffersFromWebsite ? `Email: ${emailDomain} · Website: ${websiteDomain}` : input.recruiterEmail,
+      explanation: 'This does not establish that the opportunity is fraudulent — many legitimate third-party recruiters, freelance hiring, and early-stage companies use Gmail. But it means the recruiter\'s affiliation with the company is not yet independently verified.',
+      action: 'Verify the recruiter\'s affiliation through the company\'s official website or another independent channel before proceeding.',
     });
     scoreContribution += 10;
-
-    if (websiteDomain && websiteDomain !== emailDomain) {
-      findings.push({
-        id: nextId(),
-        category: 'email',
-        severity: 'high',
-        title: `Email domain “${emailDomain}” doesn't match “${websiteDomain}”`,
-        finding: `The recruiter's email (${emailDomain}) uses a different domain from ${input.company}'s website (${websiteDomain}).`,
-        evidence: `Email: ${emailDomain} vs Website: ${websiteDomain}`,
-        explanation: 'The recruiter uses a different domain from the company. This can be legitimate for third-party recruiters, but independently verify the relationship.',
-        action: 'Contact the company directly through their official website to confirm the recruiter\'s affiliation.',
-      });
-      scoreContribution += 12;
-    }
   } else if (websiteDomain) {
     if (emailDomain === websiteDomain) {
       positives.push({
@@ -1094,33 +1158,84 @@ function analyzeOfferLetter(input: OpportunityInput): CategoryAnalysis {
   };
 }
 
+/**
+ * Non-negated hits for one bucket, e.g. NOT "we never ask for your Aadhaar".
+ * Uses a wider negation window than the default: sensitive-info disclaimers
+ * commonly negate a whole list from one lead word ("We never ask for your
+ * Aadhaar, bank details, or a photograph"), so the negation can sit further
+ * back from a later item than the default 25-char window allows.
+ */
+function bucketHits(text: string, keywords: string[]): string[] {
+  return keywords.filter((kw) => hasNonNegatedMention(text, kw, 60));
+}
+
 function analyzeSensitiveInfo(input: OpportunityInput): CategoryAnalysis {
   const findings: Finding[] = [];
   const gaps: string[] = [];
   let scoreContribution = 0;
 
   const text = `${input.description} ${input.recruiterMessage} ${input.offerLetter}`;
-  const hits = containsAny(text, SENSITIVE_INFO_KEYWORDS);
 
-  if (hits.length > 0) {
+  const governmentIdHits = bucketHits(text, SENSITIVE_INFO_KEYWORD_MAP.governmentId);
+  const financialHits = bucketHits(text, SENSITIVE_INFO_KEYWORD_MAP.financial);
+  const photographHits = bucketHits(text, SENSITIVE_INFO_KEYWORD_MAP.photograph);
+  // Only counts if nothing specific already matched — see GENERIC_ID_PHRASES.
+  const genericIdHits = governmentIdHits.length === 0
+    ? bucketHits(text, GENERIC_ID_PHRASES)
+    : [];
+
+  if (governmentIdHits.length > 0 || genericIdHits.length > 0) {
+    const evidence = (governmentIdHits.length > 0 ? governmentIdHits : genericIdHits)
+      .slice(0, 3).map((k) => `"${k}"`).join(', ');
     findings.push({
       id: nextId(),
       category: 'sensitive',
-      severity: 'high',
-      title: 'Sensitive information requested',
-      finding: 'The opportunity appears to request sensitive personal or financial information.',
-      evidence: hits.slice(0, 3).map((k) => `"${k}"`).join(', '),
-      explanation: 'Requests for sensitive information (ID numbers, bank details) early in the process are a significant warning sign.',
-      action: 'Avoid submitting identity, banking, or other sensitive information until the employer is independently verified.',
+      severity: 'critical',
+      title: 'Government ID requested',
+      finding: 'The opportunity asks for a government-issued identity document or ID number.',
+      evidence,
+      explanation: 'Requests for a government ID (Aadhaar, PAN, passport, driving license, voter ID) before the employer is verified are a significant warning sign — these documents enable identity theft.',
+      action: 'Do not share government ID documents or numbers until the employer is independently verified.',
     });
-    scoreContribution += 15;
+    scoreContribution += 20;
   }
+
+  if (financialHits.length > 0) {
+    findings.push({
+      id: nextId(),
+      category: 'sensitive',
+      severity: 'critical',
+      title: 'Bank or financial account details requested',
+      finding: 'The opportunity asks for bank account, card, or other financial access details.',
+      evidence: financialHits.slice(0, 3).map((k) => `"${k}"`).join(', '),
+      explanation: 'No legitimate employer needs your bank account number, card details, or PINs before or during hiring.',
+      action: 'Never share bank details, card numbers, CVV, or PINs with a recruiter.',
+    });
+    scoreContribution += 20;
+  }
+
+  if (photographHits.length > 0) {
+    findings.push({
+      id: nextId(),
+      category: 'sensitive',
+      severity: 'caution',
+      title: 'Photograph requested',
+      finding: 'The opportunity asks for a passport-size photograph.',
+      evidence: photographHits.slice(0, 3).map((k) => `"${k}"`).join(', '),
+      explanation: 'A photo alone is commonly requested by legitimate employers for ID badges or profile records, and is not on its own a sign of fraud. Treat it as routine unless paired with a government ID or payment request.',
+      action: 'A photo request alone is not a red flag — but avoid sending one alongside government ID or payment.',
+    });
+    scoreContribution += 3;
+  }
+
+  const anyHit = governmentIdHits.length > 0 || genericIdHits.length > 0
+    || financialHits.length > 0 || photographHits.length > 0;
 
   return {
     category: 'Sensitive Information',
-    status: hits.length > 0 ? 'suspicious' : 'partial',
-    confidence: hits.length > 0 ? 'high' : 'medium',
-    riskLevel: scoreContribution > 10 ? 'high' : 'low',
+    status: anyHit ? 'suspicious' : 'partial',
+    confidence: anyHit ? 'high' : 'medium',
+    riskLevel: scoreContribution > 15 ? 'high' : scoreContribution > 5 ? 'caution' : 'low',
     findings, positives: [], gaps, scoreContribution,
   };
 }
@@ -1490,8 +1605,7 @@ export async function analyzeOpportunity(input: OpportunityInput): Promise<Analy
   const allPositives = categories.flatMap((c) => c.positives);
   const allGaps = categories.flatMap((c) => c.gaps);
 
-  const totalScore = Math.min(100, categories.reduce((sum, c) => sum + c.scoreContribution, 0));
-  const score = Math.round(totalScore);
+  const score = computeOverallScore(allFindings);
 
   const majorWarnings = allFindings.filter((f) => f.severity === 'high' || f.severity === 'critical');
   const cautionSignals = allFindings.filter((f) => f.severity === 'caution' || f.severity === 'low');
