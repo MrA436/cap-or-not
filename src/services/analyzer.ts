@@ -13,6 +13,7 @@ import type {
 } from '../types/analysis.js';
 import { lookupDomainAge } from './rdap.js';
 import { checkWebsiteReachable } from './websiteCheck.js';
+import { inferRecruiterName } from './extract.js';
 
 function getDomainFromUrl(url: string): string | null {
   try {
@@ -350,7 +351,7 @@ function analyzeCompany(input: OpportunityInput): CategoryAnalysis {
   };
 }
 
-function analyzeRecruiterIdentity(input: OpportunityInput): CategoryAnalysis {
+function analyzeRecruiterIdentity(input: OpportunityInput, nameWasExtracted = false): CategoryAnalysis {
   const findings: Finding[] = [];
   const positives: Finding[] = [];
   const gaps: string[] = [];
@@ -407,7 +408,10 @@ function analyzeRecruiterIdentity(input: OpportunityInput): CategoryAnalysis {
       scoreContribution += 8;
     }
 
-    if (input.recruiterName.trim() && msgLower.includes(input.recruiterName.toLowerCase().split(' ')[0])) {
+    // Only meaningful when the person typed the name themselves. If we pulled
+    // the name OUT of this same text, "the name appears in the text" is
+    // circular and would be a fake positive.
+    if (!nameWasExtracted && input.recruiterName.trim() && msgLower.includes(input.recruiterName.toLowerCase().split(' ')[0])) {
       positives.push({
         id: nextId(),
         category: 'recruiter',
@@ -1452,6 +1456,19 @@ export async function analyzeOpportunity(input: OpportunityInput): Promise<Analy
     }
   }
 
+  // Recruiter name: if the form field is empty but the pasted text has a
+  // labelled "Recruiter: <Name>" line, use it. Extraction failure just leaves
+  // the honest "not provided" gap in place.
+  let recruiterNameExtracted = false;
+  if (!effectiveInput.recruiterName.trim()) {
+    const combinedText = `${input.recruiterMessage}\n${input.description}\n${input.offerLetter}`;
+    const name = inferRecruiterName(combinedText);
+    if (name) {
+      effectiveInput = { ...effectiveInput, recruiterName: name };
+      recruiterNameExtracted = true;
+    }
+  }
+
   const companyCategory = analyzeCompany(effectiveInput);
   if (inferredCompanyFinding) companyCategory.positives.push(inferredCompanyFinding);
   await applyDomainAgeSignal(effectiveInput, companyCategory);
@@ -1459,7 +1476,7 @@ export async function analyzeOpportunity(input: OpportunityInput): Promise<Analy
 
   const categories: CategoryAnalysis[] = [
     companyCategory,
-    analyzeRecruiterIdentity(effectiveInput),
+    analyzeRecruiterIdentity(effectiveInput, recruiterNameExtracted),
     analyzeEmailDomain(effectiveInput),
     analyzeJobPosting(effectiveInput),
     analyzePayment(`${effectiveInput.offerLetter} ${effectiveInput.recruiterMessage} ${effectiveInput.description}`),
