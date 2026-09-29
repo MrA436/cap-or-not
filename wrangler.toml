@@ -15,3 +15,6 @@ compatibility_flags = ["nodejs_compat"]
 [[hyperdrive]]
 binding = "HYPERDRIVE"
 id = "9057b35c786c4236b5d3fe496966535a"
+
+[vars]
+RAZORPAY_KEY_ID = "rzp_live_ThWrYfrDrIhNnN"
