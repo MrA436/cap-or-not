@@ -1,22 +1,21 @@
 /**
- * PROVIDER: OpenRouter, model deepseek/deepseek-r1-0528:free.
+ * PROVIDER: OpenRouter, model meta-llama/llama-3.1-8b-instruct:free.
  *
  * OpenRouter uses an OpenAI-compatible /chat/completions endpoint, not
  * Anthropic's tool-use format — swapping to a different OpenRouter model,
  * or to a different OpenAI-compatible provider entirely, mostly means
  * changing MODEL and OPENROUTER_URL below. Swapping to a genuinely
  * different API shape (e.g. Anthropic, Gemini's native API) means
- * rewriting the fetch call and buildRequestBody().
+ * rewriting the fetch call.
  *
- * R1 is a REASONING model, which shapes two design choices here:
- *  - It "thinks" in <think>...</think> text that can appear inside the
- *    response content before the actual answer. Response parsing strips
- *    this out before looking for JSON, rather than assuming content IS
- *    the JSON.
- *  - Reasoning models are less reliable at strict function/tool-calling
- *    than instruction-tuned chat models, so this asks for plain JSON in
- *    the prompt and parses defensively, rather than relying on OpenAI-style
- *    forced tool-calls the way the previous Anthropic version did.
+ * Previously used deepseek/deepseek-r1-0528:free (a reasoning model) —
+ * switched away because R1's "thinking" pass made a trivial two-field
+ * extraction take 10-60+ seconds on the free tier, which is a bad
+ * trade-off for this task. Llama 3.1 8B is a plain instruct model:
+ * responds in a couple seconds and never emits <think> reasoning text.
+ * The <think>-stripping and code-fence-stripping logic below is kept
+ * anyway, harmlessly, as defense against whatever model ends up here
+ * next.
  *
  * LLM extraction layer — an UPGRADE to, not a replacement for, the
  * deterministic extractors in extract.ts. Design rules, all load-bearing:
@@ -56,8 +55,8 @@
  */
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const MODEL = 'deepseek/deepseek-r1-0528:free';
-const TIMEOUT_MS = 12000; // free-tier reasoning models are slower than a typical chat model
+const MODEL = 'meta-llama/llama-3.1-8b-instruct:free';
+const TIMEOUT_MS = 8000; // plain instruct model — should typically respond in 1-3s
 const MAX_INPUT_CHARS = 6000; // keep prompts small & cheap; long inputs are truncated, not rejected
 
 export interface LlmExtractionResult {

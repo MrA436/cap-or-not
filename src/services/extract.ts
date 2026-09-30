@@ -57,7 +57,7 @@ function toTitleCase(tok: string): string {
 function parseNameFromRemainder(remainder: string): string | null {
   // Stop at the first separator that ends a name on a line.
   const cut = remainder.split(/[,|(<@\d:;/\\]|\s[-–—]\s|\s{2,}/)[0].trim();
-  let rest = cut.replace(TITLE_PREFIX, '');
+  const rest = cut.replace(TITLE_PREFIX, '');
   if (!rest) return null;
 
   const tokens: string[] = [];
