@@ -12,10 +12,35 @@ import type {
   RecommendedActionPlan,
   PreviewTier,
 } from '../types/analysis.js';
-import { lookupDomainAge } from './rdap.js';
-import { checkWebsiteReachable } from './websiteCheck.js';
-import { inferRecruiterName } from './extract.js';
-import { extractWithLlm } from './llmExtract.js';
+import { resolveContradictions } from './contradictionValidator.js';
+import {
+  extractFacts,
+  signalsOf,
+  phrasesOf,
+  paymentsOf,
+  type CanonicalFacts,
+  type ExtractOptions,
+  type Fact,
+  type Verified,
+} from './facts.js';
+import { FindingFactory, type IntegrityViolation } from './findingFactory.js';
+import type { LlmExtractionResult } from './llmExtract.js';
+
+/**
+ * ENGINE SHAPE (see facts.ts / findingFactory.ts):
+ *
+ *   OpportunityInput → extractFacts() → CanonicalFacts → analyze*(facts, fx) → findings → score
+ *
+ * Rules for everything in this file:
+ *  - Analyzers receive `CanonicalFacts`, never `OpportunityInput`. They do not
+ *    scan raw text; if they need a new kind of fact, it is added to facts.ts.
+ *  - Findings are built ONLY through `fx.add()` / `fx.make()`, citing the
+ *    verified facts they are about.
+ *  - Nothing here interpolates a brand, amount, company or recruiter name
+ *    that did not come from a fact.
+ *  - No I/O. Network probes (website reachability, domain age) run inside
+ *    extractFacts() and arrive here as verified `observation` facts.
+ */
 
 function getDomainFromUrl(url: string): string | null {
   try {
@@ -31,44 +56,10 @@ function getDomainFromEmail(email: string): string | null {
   return match ? match[1] : null;
 }
 
-const COMMON_NON_COMPANY_WORDS = new Set([
-  'we', 'our', 'the', 'this', 'you', 'your', 'about', 'role', 'job',
-  'position', 'team', 'company', 'apply', 'work', 'i', 'a', 'an',
-]);
-
-/**
- * Best-effort company name extraction from unstructured pasted text or a
- * website domain, used only when the person didn't type a company name
- * themselves. This is regex/heuristic-based, not real NLP — it exists so
- * an obviously-named company (e.g. "Parsewave creates high-quality...")
- * doesn't get reported as a verification gap when the name is sitting
- * right there in the text. Returns null rather than guessing wrong; a
- * missed extraction just falls back to the honest "not provided" gap.
- */
-function inferCompanyName(text: string): string | null {
-  const patterns = [
-    /\babout\s+(?:the\s+job\s*[\r\n]+)?([A-Z][A-Za-z0-9&.,'-]{1,40}?)\s+(?:creates|is|builds|provides|offers|helps|was founded|specializes|develops)\b/i,
-    /\bjoin\s+([A-Z][A-Za-z0-9&.,'-]{1,40}?)(?:[.,!]|\s+as\s+|\s+to\s+)/,
-    /^([A-Z][A-Za-z0-9&.,'-]{1,40}?)\s+is\s+(?:a|an|looking for|hiring|seeking)\b/m,
-    /\bat\s+([A-Z][A-Za-z0-9&.,'-]{1,40}?)[.,!\n]/,
-  ];
-  for (const p of patterns) {
-    const m = text.match(p);
-    const candidate = m?.[1]?.trim();
-    if (candidate && candidate.length > 1 && !COMMON_NON_COMPANY_WORDS.has(candidate.toLowerCase())) {
-      return candidate;
-    }
-  }
-  return null;
-}
-
-function inferCompanyNameFromWebsite(website: string): string | null {
-  const domain = getDomainFromUrl(website);
-  if (!domain) return null;
-  const label = domain.split('.')[0];
-  if (!label || label.length < 2) return null;
-  return label.charAt(0).toUpperCase() + label.slice(1);
-}
+type VFact = Verified<Fact>;
+/** Collects the non-null facts a finding is about. */
+const cite = (...xs: (VFact | null | undefined)[]): VFact[] => xs.filter((x): x is VFact => !!x);
+const quoted = (xs: string[]) => xs.map((k) => `"${k}"`).join(', ');
 
 const FREE_EMAIL_PROVIDERS = new Set([
   'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'live.com',
@@ -76,151 +67,8 @@ const FREE_EMAIL_PROVIDERS = new Set([
   'zoho.com', 'gmx.com', 'rediff.com', 'yahoo.co.in', 'rocketmail.com',
 ]);
 
-const MESSAGING_PLATFORMS = ['whatsapp', 'telegram', 'signal', 'discord', 'wechat'];
 const JOB_PLATFORMS = ['linkedin', 'indeed', 'glassdoor', 'naukri', 'internshala', 'monster', 'angel.co', 'wellfound'];
 
-// Phrases that inherently describe the applicant being asked to pay the
-// company — these are safe to flag on their own.
-const PAYMENT_DEMAND_KEYWORDS = [
-  'registration fee', 'application fee', 'security deposit', 'training fee',
-  'training cost', 'certification fee', 'certificate fee', 'laptop deposit',
-  'equipment deposit', 'equipment fee', 'refundable deposit', 'onboarding fee',
-  'onboarding charge', 'interview fee', 'registration charge', 'processing fee',
-  'security money', 'advance payment', 'upfront payment',
-  'pay ₹', 'pay rs', 'pay $', 'transfer funds', 'wire transfer', 'bank transfer',
-  'gift card', 'amazon gift', 'itunes gift', 'google play gift',
-  'wire money', 'send money', 'registration amount', 'payment required',
-  'training charges', 'course fee',
-];
-
-// Crypto terms are only meaningful as a red flag when paired with an
-// actual payment-demand verb nearby — a bare mention of "ether" or
-// "crypto" isn't evidence of anything asked of the applicant.
-const CRYPTO_TERMS = ['bitcoin', 'cryptocurrency', 'crypto payment', 'usdt', 'ether', 'eth wallet'];
-const PAYMENT_DEMAND_VERBS = ['pay', 'payment', 'send', 'transfer', 'deposit', 'wire'];
-
-// If these appear in the same sentence as a dollar amount, that amount is
-// compensation being offered TO the applicant, not a payment being
-// demanded FROM them — the opposite of a red flag.
-const COMPENSATION_CONTEXT_PATTERNS = [
-  'per month', '/month', 'per week', '/week', 'per hour', '/hour', 'per day',
-  'salary', 'compensation', 'stipend', 'paid trial', 'you will be paid',
-  'you will receive', 'we pay', 'earned by', 'monthly pay', 'take-home',
-  'base pay', 'pay range', 'above market', 'market average', 'earn up to',
-];
-
-const PRESSURE_KEYWORDS = [
-  'urgent', 'immediately', 'asap', 'right away', 'limited time', 'offer expires',
-  'act now', 'respond quickly', 'quick response', 'deadline', 'last chance',
-  'hurry', 'don\'t miss', 'closing soon', 'apply now or',
-];
-
-const SCAM_JOB_KEYWORDS = [
-  'no experience required', 'no experience needed', 'no skills required',
-  'no interview required', 'guaranteed income', 'guaranteed job',
-  'guaranteed employment', 'instant selection', 'immediate selection',
-  'selected immediately', 'work from home', 'earn money online',
-  'easy money', 'get rich', 'earn ₹', 'earn $', 'per day', 'per week',
-  'data entry jobs', 'typing jobs', 'form filling', 'captcha work',
-  'unlimited earning', 'be your own boss',
-];
-
-const BRAND_NAMES = [
-  'amazon', 'google', 'microsoft', 'apple', 'facebook', 'meta', 'netflix',
-  'ibm', 'oracle', 'salesforce', 'adobe', 'intel', 'cisco', 'tesla',
-  'walmart', 'target', 'jpmorgan', 'goldman sachs', 'morgan stanley',
-  'deloitte', 'ey', 'pwc', 'kpmg', 'accenture', 'capgemini', 'tata',
-  'infosys', 'wipro', 'tcs', 'hcl', 'cognizant', 'flipkart', 'swiggy',
-  'zomato', 'paytm', 'phonepe', 'reliance', 'airtel', 'jio',
-];
-
-const GOVERNMENT_KEYWORDS = [
-  'government approved', 'govt approved', 'msme approved', 'msme registered',
-  'aicte approved', 'aicte', 'government recognized', 'govt recognized',
-  'ministry of', 'official partner of', 'affiliated with government',
-  'government internship', 'govt internship', 'niti aayog',
-];
-
-// Sensitive-info detection is split by WHAT is being asked for, because a
-// passport-size photograph and an Aadhaar number are not the same category
-// of risk. Each keyword maps to exactly one bucket so a single mention isn't
-// double-counted across buckets.
-type SensitiveInfoBucket = 'governmentId' | 'financial' | 'photograph';
-
-const SENSITIVE_INFO_KEYWORD_MAP: Record<SensitiveInfoBucket, string[]> = {
-  // Government-issued identity documents / numbers.
-  governmentId: [
-    'aadhaar', 'aadhar', 'pan card', 'pan number', 'ssn', 'social security',
-    'passport number', 'passport copy', 'copy of your passport',
-    'driving license', "driver's license", 'voter id', 'voter card',
-    'ration card',
-  ],
-  // Financial account access — distinct from a government ID.
-  financial: [
-    'bank account', 'bank details', 'banking details', 'account number',
-    'ifsc', 'credit card', 'debit card', 'card number', 'cvv',
-    'net banking', 'upi pin', 'atm pin',
-  ],
-  // A photograph alone is asked for in plenty of legitimate hiring flows
-  // (ID badges, LinkedIn-style profile photos). It is not government-ID-level
-  // sensitive on its own, so it is scored separately and lower.
-  photograph: [
-    'passport-size photograph', 'passport size photograph',
-    'passport photo', 'photograph', 'photo id',
-  ],
-};
-
-// Generic phrases that mean "some form of ID" without saying which. Only
-// used to raise confidence when nothing more specific matched — never
-// counted alongside a specific document, to avoid double-counting the same
-// request under two labels.
-const GENERIC_ID_PHRASES = ['identity proof', 'id proof', 'government id', 'govt id'];
-
-let findingCounter = 0;
-function nextId(): string {
-  findingCounter += 1;
-  return `finding-${findingCounter}`;
-}
-
-const NEGATION_MARKERS = [
-  'no', 'not', 'without', 'never', 'none', "isn't", "aren't", "doesn't",
-  "don't", "won't", 'isnt', 'arent', 'doesnt', 'dont', 'wont', 'lacking', 'lacks',
-];
-
-/**
- * True if `keyword` appears in `text` at least once WITHOUT a negation
- * word (no, not, without, never, ...) within the preceding ~25
- * characters. This is what "positive signal" checks need to use instead
- * of a bare .includes() — otherwise "No technical interview is required"
- * gets read as "interview mentioned = good sign", which is exactly
- * backwards. If every occurrence of the keyword is negated (or the
- * keyword never appears at all), this returns false.
- */
-function hasNonNegatedMention(text: string, keyword: string, windowChars = 25): boolean {
-  const lower = text.toLowerCase();
-  const kw = keyword.toLowerCase();
-  let idx = lower.indexOf(kw);
-  while (idx !== -1) {
-    const before = lower.slice(Math.max(0, idx - windowChars), idx);
-    const negated = NEGATION_MARKERS.some((n) => new RegExp(`\\b${n}\\b`).test(before));
-    if (!negated) return true;
-    idx = lower.indexOf(kw, idx + kw.length);
-  }
-  return false;
-}
-
-function containsAny(text: string, keywords: string[]): string[] {
-  // Word-boundary matching, not raw substring containment. Substring
-  // matching was causing real false positives — e.g. the keyword "ether"
-  // (crypto slang) matching inside the ordinary word "whether", since
-  // "whether".includes("ether") is true. \b correctly rejects that while
-  // still matching "ether" as its own word, and works the same way for
-  // multi-word phrases like "registration fee".
-  return keywords.filter((k) => {
-    const escaped = k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return new RegExp(`\\b${escaped}\\b`, 'i').test(text);
-  });
-}
 
 function detectLookalikeDomain(emailDomain: string, companyDomain: string): boolean {
   if (!emailDomain || !companyDomain) return false;
@@ -323,14 +171,16 @@ interface CategoryAnalysis {
   scoreContribution: number;
 }
 
-function analyzeCompany(input: OpportunityInput): CategoryAnalysis {
+function analyzeCompany(facts: CanonicalFacts, fx: FindingFactory): CategoryAnalysis {
   const findings: Finding[] = [];
   const positives: Finding[] = [];
   const gaps: string[] = [];
   let scoreContribution = 0;
 
-  if (!input.company.trim()) {
-    gaps.push('Company name was not provided');
+  const company = facts.company;
+  if (!company) {
+    // UNKNOWN, not "the user didn't give one": nothing in the submission yielded a verified name.
+    gaps.push('Company name was not found in the submitted text');
     return {
       category: 'Company Verification',
       status: 'unable', confidence: 'none', riskLevel: 'low',
@@ -338,77 +188,98 @@ function analyzeCompany(input: OpportunityInput): CategoryAnalysis {
     };
   }
 
-  if (!input.companyWebsite.trim()) {
-    // No website is missing information, not evidence of anything — this
-    // is a verification gap, not a red flag. It doesn't score.
-    gaps.push(`Whether "${input.company}" has a verifiable official website`);
-    gaps.push('Whether the company exists');
-    gaps.push('Whether the opportunity is consistent with the company');
+  // A name read out of the posting rather than typed into the form. Worded by how it was obtained.
+  if (company.origin === 'labelled') {
+    fx.add(positives, {
+      category: 'company',
+      severity: 'positive',
+      title: `Company name: "${company.value}"`,
+      finding: `The posting explicitly states the company name as "${company.value}".`,
+      evidence: company.value,
+      explanation: 'This was explicitly stated in the posting text, not inferred or guessed — treated the same as if it had been typed directly into the company field.',
+      action: 'Independently verify this company exists and is who they claim to be.',
+      cites: cite(company),
+    });
+  } else if (company.origin === 'prose' || company.origin === 'llm') {
+    fx.add(positives, {
+      category: 'company',
+      severity: 'positive',
+      title: `Company identified: "${company.value}"`,
+      finding: `A company name was not explicitly entered, but "${company.value}" was identified from the submitted text.`,
+      evidence: company.value,
+      explanation: company.origin === 'llm'
+        ? 'This was extracted by an AI reading pass, not a manual entry — worth double-checking it matches the actual company before relying on it.'
+        : 'This is a best-effort extraction, not a manual entry — worth double-checking it matches the actual company before relying on it.',
+      action: 'Confirm this is the correct company name.',
+      cites: cite(company),
+    });
   }
 
-  if (input.companyWebsite.trim()) {
-    const domain = getDomainFromUrl(input.companyWebsite);
+  const website = facts.website;
+  if (!website) {
+    // No website is missing information, not evidence of anything — this
+    // is a verification gap, not a red flag. It doesn't score.
+    fx.gap(gaps, `Whether "${company.value}" has a verifiable official website`, cite(company));
+    gaps.push('Whether the company exists');
+    gaps.push('Whether the opportunity is consistent with the company');
+  } else {
+    const domain = getDomainFromUrl(website.value);
     if (domain) {
-      const companyNameSlug = input.company.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const companyNameSlug = company.value.toLowerCase().replace(/[^a-z0-9]/g, '');
       const domainSlug = domain.split('.')[0];
       const isConsistent = domainSlug.includes(companyNameSlug.slice(0, 4)) ||
         companyNameSlug.includes(domainSlug.slice(0, 4));
       if (isConsistent) {
-        // A loose string match between the typed company name and the
-        // domain is not real evidence of a verified relationship —
-        // anyone can type any name next to any URL. This is honestly a
-        // verification gap, not a confirmed positive, unless something
-        // actually ties the two together (e.g. the website reachability
-        // check below, or a future check that reads the site's own
-        // stated name). Absence of a mismatch isn't presence of proof.
-        gaps.push(`Whether "${input.company}" and the domain "${domain}" are actually the same entity`);
+        // A loose string match between the company name and the domain is
+        // not evidence of a verified relationship — anyone can put any name
+        // next to any URL. It stays a verification gap, not a positive.
+        fx.gap(gaps, `Company-domain relationship: Unable to verify — "${company.value}" and the domain "${domain}" look related, but nothing independently confirms they're the same entity`, cite(company, website));
       } else {
-        findings.push({
-          id: nextId(),
+        if (fx.add(findings, {
           category: 'company',
           severity: 'caution',
-          title: `Website domain "${domain}" doesn't obviously match "${input.company}"`,
-          finding: `The website you gave for ${input.company} (${domain}) doesn't clearly match the company name.`,
-          evidence: `${input.company} — ${input.companyWebsite}`,
+          title: `Website domain "${domain}" doesn't obviously match "${company.value}"`,
+          finding: `The website you gave for ${company.value} (${domain}) doesn't clearly match the company name.`,
+          evidence: `${company.value} — ${website.value}`,
           explanation: 'This can be legitimate if the company uses a different brand name for its domain, but it warrants verification.',
           action: 'Verify the website is genuinely operated by the claimed company.',
-        });
-        scoreContribution += 8;
+          cites: cite(company, website),
+        })) scoreContribution += 8;
       }
     }
     gaps.push('Whether the company is actively operating');
   }
 
-  if (input.company.trim().length < 3) {
-    findings.push({
-      id: nextId(),
+  if (company.value.length < 3) {
+    if (fx.add(findings, {
       category: 'company',
       severity: 'caution',
-      title: `Company name "${input.company}" is unusually short or generic`,
-      finding: `The company name provided ("${input.company}") is very short or generic.`,
-      evidence: input.company,
+      title: `Company name "${company.value}" is unusually short or generic`,
+      finding: `The company name provided ("${company.value}") is very short or generic.`,
+      evidence: company.value,
       explanation: 'Vague or generic company names make it harder to verify the employer.',
       action: 'Ask the recruiter for the full registered company name.',
-    });
-    scoreContribution += 5;
+      cites: cite(company),
+    })) scoreContribution += 5;
   }
 
-  const companyLower = input.company.toLowerCase();
-  const brandClaimed = BRAND_NAMES.find((b) => companyLower.includes(b));
-  if (brandClaimed && input.recruiterEmail.trim()) {
-    const emailDomain = getDomainFromEmail(input.recruiterEmail);
+  // Only a brand that is part of the claimed company NAME counts here (word-boundary,
+  // verified in facts.ts). A brand merely mentioned in the text is handled by analyzeBrandImpersonation.
+  const brandClaimed = facts.brands.find((b) => b.viaCompanyField);
+  const email = facts.recruiterEmail;
+  if (brandClaimed && email) {
+    const emailDomain = getDomainFromEmail(email.value);
     if (emailDomain && FREE_EMAIL_PROVIDERS.has(emailDomain)) {
-      findings.push({
-        id: nextId(),
+      if (fx.add(findings, {
         category: 'company',
         severity: 'high',
-        title: `Claims to be "${brandClaimed}" but recruiter uses a personal email`,
-        finding: `The opportunity claims affiliation with "${brandClaimed}" but the recruiter uses a free email provider.`,
-        evidence: `${input.recruiterEmail}`,
+        title: `Claims to be "${brandClaimed.value}" but recruiter uses a personal email`,
+        finding: `The opportunity claims affiliation with "${brandClaimed.value}" but the recruiter uses a free email provider.`,
+        evidence: email.value,
         explanation: 'Recruiters from major companies typically use official company email domains, not personal email services.',
         action: 'Contact the company through its official website to verify this recruiter.',
-      });
-      scoreContribution += 20;
+        cites: cite(brandClaimed, email, company),
+      })) scoreContribution += 20;
     }
   }
 
@@ -421,90 +292,72 @@ function analyzeCompany(input: OpportunityInput): CategoryAnalysis {
   };
 }
 
-function analyzeRecruiterIdentity(input: OpportunityInput, nameWasExtracted = false): CategoryAnalysis {
+function analyzeRecruiterIdentity(facts: CanonicalFacts, fx: FindingFactory): CategoryAnalysis {
   const findings: Finding[] = [];
   const positives: Finding[] = [];
   const gaps: string[] = [];
   let scoreContribution = 0;
 
-  if (!input.recruiterName.trim()) {
-    gaps.push('Recruiter name was not provided');
+  if (!facts.recruiterName) {
+    // "Not found", not "not provided": distinguishes an extractor miss from a genuine absence.
+    gaps.push('Recruiter name was not found in the submitted text');
   }
 
-  if (input.recruiterMessage.trim()) {
-    const msgLower = input.recruiterMessage.toLowerCase();
-    const pressureHits = containsAny(input.recruiterMessage, PRESSURE_KEYWORDS);
+  // Pressure tactics and messaging-platform mentions can appear anywhere in the
+  // pasted text (someone forwarding a WhatsApp chat may paste it into the
+  // description box), so facts.ts scans all three text fields for them.
+  //
+  // Deliberately NOT here: a scam-phrase check. analyzeJobPosting() already
+  // reports that exact list; a second finding would be the same evidence
+  // counted twice under another label.
+  if (facts.documents.length > 0) {
+    const pressure = signalsOf(facts, 'pressure');
+    const pressureHits = phrasesOf(pressure);
     if (pressureHits.length > 0) {
-      findings.push({
-        id: nextId(),
+      if (fx.add(findings, {
         category: 'recruiter',
         severity: pressureHits.length > 2 ? 'high' : 'caution',
         title: 'Pressure tactics detected in communication',
-        finding: 'The recruiter message uses urgency or pressure language.',
-        evidence: pressureHits.slice(0, 3).map((k) => `"${k}"`).join(', '),
+        finding: 'The submitted text uses urgency or pressure language.',
+        evidence: quoted(pressureHits.slice(0, 3)),
         explanation: 'Pressuring candidates to respond quickly is a common tactic in fraudulent recruitment.',
         action: 'Take your time. Legitimate employers do not pressure candidates to make immediate decisions.',
-      });
-      scoreContribution += pressureHits.length > 2 ? 15 : 8;
+        cites: pressure,
+      })) scoreContribution += pressureHits.length > 2 ? 15 : 8;
     }
 
-    const scamHits = containsAny(input.recruiterMessage, SCAM_JOB_KEYWORDS);
-    if (scamHits.length > 0) {
-      findings.push({
-        id: nextId(),
-        category: 'recruiter',
-        severity: scamHits.length > 2 ? 'high' : 'caution',
-        title: 'Common scam job phrases detected',
-        finding: 'The message contains phrases commonly associated with fraudulent job postings.',
-        evidence: scamHits.slice(0, 3).map((k) => `"${k}"`).join(', '),
-        explanation: 'Promises of easy money, no experience needed, or guaranteed income are major red flags.',
-        action: 'Be very cautious. Legitimate jobs rarely guarantee income or require no experience.',
-      });
-      scoreContribution += scamHits.length > 2 ? 15 : 8;
-    }
-
-    const platformHits = MESSAGING_PLATFORMS.filter((p) => msgLower.includes(p));
+    const platforms = signalsOf(facts, 'messaging_platform');
+    const platformHits = phrasesOf(platforms);
     if (platformHits.length > 0) {
-      findings.push({
-        id: nextId(),
+      if (fx.add(findings, {
         category: 'recruiter',
         severity: 'caution',
         title: 'Messaging app as primary contact channel',
-        finding: `The recruiter asks to communicate via ${platformHits.join(', ')}.`,
-        evidence: platformHits.map((p) => `"${p}"`).join(', '),
+        finding: `The opportunity asks you to communicate via ${platformHits.join(', ')}.`,
+        evidence: quoted(platformHits),
         explanation: 'While some legitimate recruiters use messaging apps, making them the sole or primary communication channel is a risk indicator.',
         action: 'Verify the recruiter through official company channels before sharing information.',
-      });
-      scoreContribution += 8;
+        cites: platforms,
+      })) scoreContribution += 8;
     }
 
-    // Only meaningful when the person typed the name themselves. If we pulled
-    // the name OUT of this same text, "the name appears in the text" is
-    // circular and would be a fake positive.
-    if (!nameWasExtracted && input.recruiterName.trim() && msgLower.includes(input.recruiterName.toLowerCase().split(' ')[0])) {
-      positives.push({
-        id: nextId(),
+    // Only meaningful for a name the person TYPED: a name extracted out of this
+    // same text would make "the name appears in the text" circular. facts.ts
+    // only emits this signal for typed names.
+    const nameInText = signalsOf(facts, 'recruiter_name_in_text')[0];
+    if (facts.recruiterName && nameInText) {
+      fx.add(positives, {
         category: 'recruiter',
         severity: 'positive',
         title: 'Recruiter name is present in communication',
-        finding: 'The recruiter message includes the recruiter\'s name, suggesting personal communication.',
-        evidence: input.recruiterName,
+        finding: 'The submitted text includes the recruiter\'s name, suggesting personal communication.',
+        evidence: facts.recruiterName.value,
         explanation: 'Personalized communication is slightly more reassuring than generic mass outreach.',
         action: 'Still verify the recruiter independently.',
+        cites: cite(facts.recruiterName, nameInText),
       });
     }
-
-    // Brevity alone is not a red flag — removed as a scored finding.
-    // A short message isn't evidence of mass outreach any more than a
-    // long one is evidence of legitimacy. If this needs re-adding later,
-    // it should only fire in combination with other signals, never alone.
-
-    if (!input.recruiterName.trim() && input.recruiterMessage.trim()) {
-      // Not a red flag on its own — a scraped job posting or formal
-      // listing naturally has no personal "recruiter name" the way a
-      // DM-style message might. Already captured as a gap above; no
-      // separate finding or duplicate gap needed here.
-    }
+    // Brevity alone is not a red flag, so there is deliberately no finding for it.
   }
 
   return {
@@ -516,16 +369,20 @@ function analyzeRecruiterIdentity(input: OpportunityInput, nameWasExtracted = fa
   };
 }
 
-function analyzeEmailDomain(input: OpportunityInput): CategoryAnalysis {
+function analyzeEmailDomain(facts: CanonicalFacts, fx: FindingFactory): CategoryAnalysis {
   const findings: Finding[] = [];
   const positives: Finding[] = [];
   const gaps: string[] = [];
   let scoreContribution = 0;
 
-  const emailDomain = input.recruiterEmail.trim() ? getDomainFromEmail(input.recruiterEmail) : null;
-  const websiteDomain = input.companyWebsite.trim() ? getDomainFromUrl(input.companyWebsite) : null;
+  const email = facts.recruiterEmail;
+  const website = facts.website;
+  const company = facts.company;
+  const emailDomain = email ? getDomainFromEmail(email.value) : null;
+  const websiteDomain = website ? getDomainFromUrl(website.value) : null;
+  const companyName = company?.value ?? 'the company';
 
-  if (!emailDomain) {
+  if (!email || !emailDomain) {
     gaps.push('Recruiter email was not provided');
     return {
       category: 'Email / Domain Analysis',
@@ -535,41 +392,37 @@ function analyzeEmailDomain(input: OpportunityInput): CategoryAnalysis {
   }
 
   if (FREE_EMAIL_PROVIDERS.has(emailDomain)) {
-    // Single finding either way — a free provider plus "it also isn't the
-    // company's domain" are the same underlying fact (the recruiter's
-    // affiliation is unverified), not two separate pieces of evidence. This
-    // is about identity verification, not a domain-mismatch/fraud claim, so
-    // it stays at "caution" rather than "high" and the wording says exactly
-    // that: unverified, not incriminating.
+    // One finding either way: a free provider plus "it also isn't the company's
+    // domain" are the same underlying fact (the recruiter's affiliation is
+    // unverified). This is identity verification, not a fraud claim, so it
+    // stays "caution" and says exactly that.
     const alsoDiffersFromWebsite = !!websiteDomain && websiteDomain !== emailDomain;
-    findings.push({
-      id: nextId(),
+    if (fx.add(findings, {
       category: 'email',
       severity: 'caution',
       title: 'Recruiter uses a free email provider',
       finding: alsoDiffersFromWebsite
-        ? `The recruiter uses ${emailDomain} rather than an address on ${input.company || 'the company'}'s own domain (${websiteDomain}).`
+        ? `The recruiter uses ${emailDomain} rather than an address on ${companyName}'s own domain (${websiteDomain}).`
         : `The recruiter email uses a free email provider (${emailDomain}).`,
-      evidence: alsoDiffersFromWebsite ? `Email: ${emailDomain} · Website: ${websiteDomain}` : input.recruiterEmail,
+      evidence: alsoDiffersFromWebsite ? `Email: ${emailDomain} · Website: ${websiteDomain}` : email.value,
       explanation: 'This does not establish that the opportunity is fraudulent — many legitimate third-party recruiters, freelance hiring, and early-stage companies use Gmail. But it means the recruiter\'s affiliation with the company is not yet independently verified.',
       action: 'Verify the recruiter\'s affiliation through the company\'s official website or another independent channel before proceeding.',
-    });
-    scoreContribution += 10;
-  } else if (websiteDomain) {
+      cites: cite(email, alsoDiffersFromWebsite ? website : null, alsoDiffersFromWebsite ? company : null),
+    })) scoreContribution += 10;
+  } else if (website && websiteDomain) {
     if (emailDomain === websiteDomain) {
-      positives.push({
-        id: nextId(),
+      fx.add(positives, {
         category: 'email',
         severity: 'positive',
-        title: `Email domain matches ${input.company}'s website`,
+        title: `Email domain matches ${companyName}'s website`,
         finding: `The recruiter email domain (${emailDomain}) matches the company website domain.`,
         evidence: `${emailDomain} = ${websiteDomain}`,
         explanation: 'A matching domain is a strong positive signal that the recruiter is genuinely affiliated with the company.',
         action: 'Still verify the specific recruiter through the company\'s official channels.',
+        cites: cite(email, website, company),
       });
     } else if (isSubdomain(emailDomain, websiteDomain) || isSubdomain(websiteDomain, emailDomain)) {
-      positives.push({
-        id: nextId(),
+      fx.add(positives, {
         category: 'email',
         severity: 'positive',
         title: `Email domain “${emailDomain}” is related to “${websiteDomain}”`,
@@ -577,22 +430,21 @@ function analyzeEmailDomain(input: OpportunityInput): CategoryAnalysis {
         evidence: `${emailDomain} ~ ${websiteDomain}`,
         explanation: 'Related domains suggest the email is from the same organization.',
         action: 'Verify through official channels for full confidence.',
+        cites: cite(email, website),
       });
     } else if (detectLookalikeDomain(emailDomain, websiteDomain)) {
-      findings.push({
-        id: nextId(),
+      if (fx.add(findings, {
         category: 'email',
         severity: 'critical',
         title: `“${emailDomain}” closely resembles “${websiteDomain}” but isn't identical`,
-        finding: `The recruiter email domain (${emailDomain}) closely resembles ${input.company}'s domain (${websiteDomain}) but is not identical.`,
+        finding: `The recruiter email domain (${emailDomain}) closely resembles ${companyName}'s domain (${websiteDomain}) but is not identical.`,
         evidence: `${emailDomain} vs ${websiteDomain}`,
         explanation: 'Lookalike domains (e.g., "arnazon.com" instead of "amazon.com") are a hallmark of impersonation scams.',
         action: 'Do not respond until you have independently verified the correct company domain.',
-      });
-      scoreContribution += 25;
+        cites: cite(email, website, company),
+      })) scoreContribution += 25;
     } else {
-      findings.push({
-        id: nextId(),
+      if (fx.add(findings, {
         category: 'email',
         severity: 'caution',
         title: `Email domain “${emailDomain}” differs from “${websiteDomain}”`,
@@ -600,14 +452,13 @@ function analyzeEmailDomain(input: OpportunityInput): CategoryAnalysis {
         evidence: `${emailDomain} vs ${websiteDomain}`,
         explanation: 'This may be legitimate for staffing agencies, but should be verified independently.',
         action: 'Verify the recruiter\'s relationship with the company.',
-      });
-      scoreContribution += 10;
+        cites: cite(email, website),
+      })) scoreContribution += 10;
     }
   }
 
-  if (emailDomain && emailDomain.split('.').length > 4) {
-    findings.push({
-      id: nextId(),
+  if (emailDomain.split('.').length > 4) {
+    if (fx.add(findings, {
       category: 'email',
       severity: 'caution',
       title: 'Unusual email domain pattern',
@@ -615,8 +466,8 @@ function analyzeEmailDomain(input: OpportunityInput): CategoryAnalysis {
       evidence: emailDomain,
       explanation: 'Complex subdomain patterns can be used to disguise the true origin of an email.',
       action: 'Verify the domain independently.',
-    });
-    scoreContribution += 5;
+      cites: cite(email),
+    })) scoreContribution += 5;
   }
 
   return {
@@ -628,15 +479,14 @@ function analyzeEmailDomain(input: OpportunityInput): CategoryAnalysis {
   };
 }
 
-function analyzeJobPosting(input: OpportunityInput): CategoryAnalysis {
+function analyzeJobPosting(facts: CanonicalFacts, fx: FindingFactory): CategoryAnalysis {
   const findings: Finding[] = [];
   const positives: Finding[] = [];
   const gaps: string[] = [];
   let scoreContribution = 0;
 
-  const text = `${input.description} ${input.recruiterMessage} ${input.offerLetter}`;
-
-  if (!input.description.trim() && !input.recruiterMessage.trim()) {
+  const hasDescriptionOrMessage = facts.documents.some((d) => d.value === 'description' || d.value === 'recruiterMessage');
+  if (!hasDescriptionOrMessage) {
     gaps.push('Job description and recruiter message were not provided');
     return {
       category: 'Job Posting Analysis',
@@ -645,73 +495,66 @@ function analyzeJobPosting(input: OpportunityInput): CategoryAnalysis {
     };
   }
 
-  const scamHits = containsAny(text, SCAM_JOB_KEYWORDS);
+  const scam = signalsOf(facts, 'scam_promise');
+  const scamHits = phrasesOf(scam);
   if (scamHits.length > 0) {
-    findings.push({
-      id: nextId(),
+    if (fx.add(findings, {
       category: 'job',
       severity: scamHits.length > 2 ? 'high' : 'caution',
       title: scamHits.length > 2 ? 'Multiple unrealistic job promises' : 'Unrealistic job promise detected',
       finding: 'The job posting contains language commonly associated with misleading or fraudulent postings.',
-      evidence: scamHits.slice(0, 4).map((k) => `"${k}"`).join(', '),
+      evidence: quoted(scamHits.slice(0, 4)),
       explanation: 'Promises like "no experience required" combined with high pay, guaranteed income, or instant selection are major warning signs.',
       action: 'Be cautious. Research the company and role independently.',
-    });
-    scoreContribution += scamHits.length > 2 ? 15 : 8;
+      cites: scam,
+    })) scoreContribution += scamHits.length > 2 ? 15 : 8;
   }
 
-  const combinedWordCount = text.trim() ? text.trim().split(/\s+/).length : 0;
-  if (combinedWordCount > 0) {
-    if (combinedWordCount < 30) {
-      // A brief submission isn't a red flag — it's insufficient
-      // information to assess the role, which belongs in gaps, not
-      // findings. Don't penalize the score for something the person
-      // simply didn't have to paste in.
+  if (facts.wordCount > 0) {
+    if (facts.wordCount < 30) {
+      // A brief submission isn't a red flag — it's insufficient information to
+      // assess the role, which belongs in gaps, not findings.
       gaps.push('Whether enough detail was provided to assess the role');
     } else {
-      positives.push({
-        id: nextId(),
+      fx.add(positives, {
         category: 'job',
         severity: 'positive',
         title: 'Enough detail provided to assess the role',
         finding: 'Enough information was provided to meaningfully assess the opportunity.',
-        evidence: `${combinedWordCount} words`,
+        evidence: `${facts.wordCount} words`,
         explanation: 'More detail allows for a better assessment of the opportunity.',
         action: 'Verify the details against the company\'s official careers page.',
+        cites: facts.documents,
       });
     }
   }
 
-  if (input.jobTitle.trim()) {
-    const titleLower = input.jobTitle.toLowerCase();
-    if (titleLower.includes('data entry') && text.toLowerCase().includes('work from home')) {
-      findings.push({
-        id: nextId(),
-        category: 'job',
-        severity: 'high',
-        title: 'Data entry + work from home pattern',
-        finding: 'The role involves data entry with work from home, a pattern commonly seen in fraudulent postings.',
-        evidence: input.jobTitle,
-        explanation: 'Data entry work-from-home jobs are frequently used in scams that ask for upfront deposits.',
-        action: 'Be extremely cautious and verify the company independently.',
-      });
-      scoreContribution += 15;
-    }
+  const wfh = signalsOf(facts, 'work_from_home')[0];
+  if (facts.jobTitle && wfh && facts.jobTitle.value.toLowerCase().includes('data entry')) {
+    if (fx.add(findings, {
+      category: 'job',
+      severity: 'high',
+      title: 'Data entry + work from home pattern',
+      finding: 'The role involves data entry with work from home, a pattern commonly seen in fraudulent postings.',
+      evidence: facts.jobTitle.value,
+      explanation: 'Data entry work-from-home jobs are frequently used in scams that ask for upfront deposits.',
+      action: 'Be extremely cautious and verify the company independently.',
+      cites: cite(facts.jobTitle, wfh),
+    })) scoreContribution += 15;
   }
 
-  if (input.jobPostingUrl.trim()) {
-    const url = input.jobPostingUrl.toLowerCase();
-    const onPlatform = JOB_PLATFORMS.some((p) => url.includes(p));
-    if (onPlatform) {
-      positives.push({
-        id: nextId(),
+  if (facts.jobUrl) {
+    const url = facts.jobUrl.value.toLowerCase();
+    if (JOB_PLATFORMS.some((p) => url.includes(p))) {
+      fx.add(positives, {
         category: 'job',
         severity: 'positive',
         title: 'Job posted on a recognized platform',
         finding: 'The job posting URL links to a recognized job platform.',
-        evidence: input.jobPostingUrl,
+        evidence: facts.jobUrl.value,
         explanation: 'Jobs on established platforms have some level of platform review, though scams still appear.',
         action: 'Check the poster\'s profile on the platform for authenticity.',
+        cites: cite(facts.jobUrl),
       });
     }
   }
@@ -725,13 +568,21 @@ function analyzeJobPosting(input: OpportunityInput): CategoryAnalysis {
   };
 }
 
-function analyzePayment(text: string): CategoryAnalysis {
+/**
+ * Payment direction is a property of each payment FACT (facts.ts decides it,
+ * per clause). This analyzer never looks at text and never pairs an amount
+ * with a cue itself — it only reads which way the money flows:
+ *   candidate_pays     → the red flag (fee / deposit / "you pay").
+ *   candidate_receives → compensation (stipend / salary / "we pay").
+ *   unknown            → ignored; no direction evidence, no claim.
+ */
+function analyzePayment(facts: CanonicalFacts, fx: FindingFactory): CategoryAnalysis {
   const findings: Finding[] = [];
   const positives: Finding[] = [];
   const gaps: string[] = [];
   let scoreContribution = 0;
 
-  if (!text.trim()) {
+  if (facts.documents.length === 0) {
     gaps.push('No offer letter or additional information provided');
     return {
       category: 'Payment / Money Detection',
@@ -740,86 +591,53 @@ function analyzePayment(text: string): CategoryAnalysis {
     };
   }
 
-  // Full amount token, including "k"/lakh/crore suffixes and comma
-  // grouping — the previous regex truncated "$5k" down to "$5".
-  const AMOUNT_REGEX = /(?:₹|\$|€|£|Rs\.?|INR)\s?\d{1,3}(?:,\d{2,3})*(?:\.\d+)?\s?(?:k|K|lakh|lakhs|crore|crores)?(?:\s?\/\s?(?:month|mo|week|wk|hour|hr|day))?/g;
+  const demands = paymentsOf(facts, 'candidate_pays');
+  const receives = paymentsOf(facts, 'candidate_receives');
 
-  // Sentence-level analysis so a dollar amount is only ever treated as a
-  // "payment requested from you" red flag when it actually appears in a
-  // sentence that's demanding payment — not anywhere compensation is
-  // mentioned. This is what fixes "$5k/month earned by top contributors"
-  // being misread as a payment request.
-  const sentences = text.split(/(?<=[.!?\n])\s+/).filter((s) => s.trim());
+  const purposes = Array.from(new Set(demands.flatMap((d) => (d.purpose ? [d.purpose] : d.cues))));
+  const demandAmounts = Array.from(new Set(demands.flatMap((d) => d.amounts)));
 
-  const demandHitsAll = new Set<string>();
-  const flaggedAmounts: string[] = [];
-  let compensationAmountFound = false;
-
-  for (const sentence of sentences) {
-    const demandHits = containsAny(sentence, PAYMENT_DEMAND_KEYWORDS);
-    const cryptoHits = containsAny(sentence, CRYPTO_TERMS);
-    const hasDemandVerb = containsAny(sentence, PAYMENT_DEMAND_VERBS).length > 0;
-    // A crypto term only counts as a demand if it's paired with an actual
-    // payment verb in the same sentence — "ether" or "crypto" mentioned
-    // on its own isn't evidence anyone is being asked to pay anything.
-    const effectiveCryptoHits = hasDemandVerb ? cryptoHits : [];
-
-    const allDemandHits = [...demandHits, ...effectiveCryptoHits];
-    const isCompensationSentence = containsAny(sentence, COMPENSATION_CONTEXT_PATTERNS).length > 0;
-    const amountsInSentence = sentence.match(AMOUNT_REGEX);
-
-    if (allDemandHits.length > 0) {
-      allDemandHits.forEach((h) => demandHitsAll.add(h));
-      if (amountsInSentence) flaggedAmounts.push(...amountsInSentence);
-    } else if (amountsInSentence && isCompensationSentence) {
-      compensationAmountFound = true;
-    }
-  }
-
-  const paymentHits = Array.from(demandHitsAll);
-
-  if (paymentHits.length > 0) {
-    findings.push({
-      id: nextId(),
+  if (demands.length > 0) {
+    // A demand and its amount are two attributes of ONE event (the candidate is
+    // asked to pay a specific amount for a specific reason), so one finding.
+    // Only amounts whose own clause is a candidate→company payment can appear
+    // here; a stipend can't, because it lives in a candidate_receives fact.
+    const hasAmount = demandAmounts.length > 0;
+    const amountText = hasAmount ? demandAmounts[0].trim() : '';
+    const lead = purposes[0] ?? 'payment';
+    if (fx.add(findings, {
       category: 'payment',
       severity: 'critical',
-      title: `Asked to pay: "${paymentHits[0]}"`,
-      finding: `The opportunity mentions "${paymentHits[0]}"${paymentHits.length > 1 ? ` and ${paymentHits.length - 1} other payment-related phrase${paymentHits.length > 2 ? 's' : ''}` : ''} — a payment before employment or internship begins.`,
-      evidence: paymentHits.slice(0, 4).map((k) => `"${k}"`).join(', '),
-      explanation: 'Legitimate opportunities can have paid training or other costs in some contexts, but unexpected upfront payments are a major warning sign and should be independently verified.',
-      action: 'Do not pay until you have independently verified the opportunity through official company channels.',
-    });
-    scoreContribution += 30;
-
-    if (flaggedAmounts.length > 0) {
-      findings.push({
-        id: nextId(),
-        category: 'payment',
-        severity: 'high',
-        title: `Specific amount requested: ${flaggedAmounts[0]}`,
-        finding: `A specific amount (${flaggedAmounts.slice(0, 3).join(', ')}) is mentioned alongside payment-request language.`,
-        evidence: flaggedAmounts.slice(0, 3).join(', '),
-        explanation: 'Requests for specific upfront amounts are a hallmark of advance-fee fraud.',
-        action: 'Do not transfer any money. Verify the opportunity independently first.',
-      });
-      scoreContribution += 10;
-    }
-  } else if (compensationAmountFound) {
-    positives.push({
-      id: nextId(),
+      tag: 'payment.demand',
+      title: hasAmount
+        ? `Candidate payment required — ${amountText} ${lead}`
+        : `Asked to pay: "${lead}"`,
+      finding: hasAmount
+        ? `The opportunity requires the candidate to pay ${amountText} as a "${lead}"${purposes.length > 1 ? ` (and ${purposes.length - 1} other payment-related phrase${purposes.length > 2 ? 's' : ''})` : ''} before employment or internship begins.`
+        : `The opportunity mentions "${lead}"${purposes.length > 1 ? ` and ${purposes.length - 1} other payment-related phrase${purposes.length > 2 ? 's' : ''}` : ''} — a payment before employment or internship begins.`,
+      evidence: hasAmount
+        ? `${demandAmounts.slice(0, 3).map((a) => a.trim()).join(', ')} — ${quoted(purposes.slice(0, 4))}`
+        : quoted(purposes.slice(0, 4)),
+      explanation: 'Legitimate opportunities can have paid training or other costs in some contexts, but unexpected upfront payments — especially a specific demanded amount — are a major warning sign and a hallmark of advance-fee fraud. This should be independently verified.',
+      action: 'Do not pay or transfer any money until you have independently verified the opportunity through official company channels.',
+      cites: demands,
+    })) scoreContribution += 30;
+  } else if (receives.length > 0) {
+    fx.add(positives, {
       category: 'payment',
       severity: 'positive',
+      tag: 'payment.compensation_no_demand',
       title: 'Compensation details provided, no payment requested',
       finding: 'A specific compensation amount is mentioned, and no payment is requested from the applicant.',
       evidence: 'Amount appears alongside compensation language (e.g. "per month", "salary"), not payment-demand language',
       explanation: 'Money described as being paid to the applicant is the opposite of a red flag — this only becomes a concern if a separate, genuine payment request also appears elsewhere.',
       action: 'Independently verify the compensation is realistic for the role and market.',
+      cites: receives,
     });
   }
 
-  if (paymentHits.length === 0 && text.trim().length > 50) {
-    positives.push({
-      id: nextId(),
+  if (demands.length === 0 && facts.textChars > 50) {
+    fx.add(positives, {
       category: 'payment',
       severity: 'positive',
       title: 'No payment requests detected',
@@ -827,28 +645,26 @@ function analyzePayment(text: string): CategoryAnalysis {
       evidence: 'Scanned offer letter and additional information',
       explanation: 'The absence of payment requests is a positive signal.',
       action: 'Remain cautious and verify all other aspects of the opportunity.',
+      cites: facts.documents,
     });
   }
 
   return {
     category: 'Payment / Money Detection',
-    status: paymentHits.length > 0 ? 'suspicious' : 'partial',
-    confidence: paymentHits.length > 0 ? 'high' : 'medium',
+    status: demands.length > 0 ? 'suspicious' : 'partial',
+    confidence: demands.length > 0 ? 'high' : 'medium',
     riskLevel: scoreContribution > 20 ? 'high' : scoreContribution > 0 ? 'caution' : 'low',
     findings, positives, gaps, scoreContribution,
   };
 }
 
-function analyzeRecruitmentProcess(input: OpportunityInput): CategoryAnalysis {
+function analyzeRecruitmentProcess(facts: CanonicalFacts, fx: FindingFactory): CategoryAnalysis {
   const findings: Finding[] = [];
   const positives: Finding[] = [];
   const gaps: string[] = [];
   let scoreContribution = 0;
 
-  const text = `${input.description} ${input.recruiterMessage} ${input.offerLetter}`;
-  const lower = text.toLowerCase();
-
-  if (!text.trim()) {
+  if (facts.documents.length === 0) {
     gaps.push('No process information provided');
     return {
       category: 'Recruitment Process',
@@ -857,23 +673,24 @@ function analyzeRecruitmentProcess(input: OpportunityInput): CategoryAnalysis {
     };
   }
 
-  if (lower.includes('no interview') || lower.includes('without interview') || lower.includes('no interview required')) {
-    findings.push({
-      id: nextId(),
+  const noInterview = signalsOf(facts, 'no_interview');
+  if (noInterview.length > 0) {
+    if (fx.add(findings, {
       category: 'process',
       severity: 'high',
+      tag: 'process.no_interview',
       title: 'No formal interview mentioned',
       finding: 'The opportunity appears to proceed without a formal interview.',
       evidence: '"no interview" detected in text',
       explanation: 'Legitimate employers typically conduct interviews. Selection without any interview is a major red flag.',
       action: 'Ask about the interview process. A legitimate employer will have one.',
-    });
-    scoreContribution += 15;
+      cites: noInterview,
+    })) scoreContribution += 15;
   }
 
-  if (lower.includes('instant') || lower.includes('immediately selected') || lower.includes('selected on the spot')) {
-    findings.push({
-      id: nextId(),
+  const instant = signalsOf(facts, 'instant_selection');
+  if (instant.length > 0) {
+    if (fx.add(findings, {
       category: 'process',
       severity: 'high',
       title: 'Instant selection detected',
@@ -881,29 +698,30 @@ function analyzeRecruitmentProcess(input: OpportunityInput): CategoryAnalysis {
       evidence: 'Instant/immediate selection language detected',
       explanation: 'Selection without meaningful evaluation is a common sign of fraudulent recruitment.',
       action: 'Be cautious. Legitimate hiring takes time and involves evaluation.',
-    });
-    scoreContribution += 12;
+      cites: instant,
+    })) scoreContribution += 12;
   }
 
-  if (
-    hasNonNegatedMention(text, 'interview') &&
-    (hasNonNegatedMention(text, 'round') || hasNonNegatedMention(text, 'technical') || hasNonNegatedMention(text, 'hr round'))
-  ) {
-    positives.push({
-      id: nextId(),
+  const interview = signalsOf(facts, 'interview');
+  const rounds = signalsOf(facts, 'interview_round');
+  if (interview.length > 0 && rounds.length > 0) {
+    fx.add(positives, {
       category: 'process',
       severity: 'positive',
+      tag: 'process.formal_interview_described',
       title: 'Formal interview process described',
       finding: 'The opportunity mentions a formal interview process.',
       evidence: 'Interview-related language detected',
       explanation: 'A described interview process is a positive signal for legitimacy.',
       action: 'Confirm the interview details through official channels.',
+      cites: cite(interview[0], rounds[0]),
     });
   }
 
-  if (lower.includes('offer letter') && !lower.includes('interview')) {
-    findings.push({
-      id: nextId(),
+  const offerMention = signalsOf(facts, 'offer_letter_mention', { includeNegated: true });
+  const anyInterviewMention = signalsOf(facts, 'interview', { includeNegated: true });
+  if (offerMention.length > 0 && anyInterviewMention.length === 0) {
+    if (fx.add(findings, {
       category: 'process',
       severity: 'caution',
       title: 'Offer letter without interview mentioned',
@@ -911,29 +729,28 @@ function analyzeRecruitmentProcess(input: OpportunityInput): CategoryAnalysis {
       evidence: 'Offer letter referenced without interview context',
       explanation: 'An offer without a preceding interview is unusual for legitimate hiring.',
       action: 'Verify whether an interview is part of the process.',
-    });
-    scoreContribution += 10;
+      cites: cite(offerMention[0]),
+    })) scoreContribution += 10;
   }
 
-  const accountKeywords = ['create an account', 'register on', 'sign up on', 'create your profile on'];
-  const accountHits = containsAny(lower, accountKeywords);
-  if (accountHits.length > 0) {
-    findings.push({
-      id: nextId(),
+  const account = signalsOf(facts, 'account_creation');
+  if (account.length > 0) {
+    if (fx.add(findings, {
       category: 'process',
       severity: 'caution',
       title: 'Asked to create account on external platform',
       finding: 'The recruiter asks candidates to create an account on a specific platform.',
-      evidence: accountHits.slice(0, 2).map((k) => `"${k}"`).join(', '),
+      evidence: quoted(phrasesOf(account).slice(0, 2)),
       explanation: 'Directing candidates to unfamiliar platforms can be a way to collect personal information.',
       action: 'Verify the platform is legitimate before creating an account.',
-    });
-    scoreContribution += 8;
+      cites: account,
+    })) scoreContribution += 8;
   }
 
-  if (lower.includes('download') && (lower.includes('app') || lower.includes('software'))) {
-    findings.push({
-      id: nextId(),
+  const download = signalsOf(facts, 'download');
+  const appOrSoftware = signalsOf(facts, 'app_or_software');
+  if (download.length > 0 && appOrSoftware.length > 0) {
+    if (fx.add(findings, {
       category: 'process',
       severity: 'caution',
       title: 'Asked to download software',
@@ -941,8 +758,8 @@ function analyzeRecruitmentProcess(input: OpportunityInput): CategoryAnalysis {
       evidence: 'Download instructions detected',
       explanation: 'Requests to download unknown software can be a vector for malware or scams.',
       action: 'Verify the software is legitimate and from an official source before downloading.',
-    });
-    scoreContribution += 5;
+      cites: cite(download[0], appOrSoftware[0]),
+    })) scoreContribution += 5;
   }
 
   return {
@@ -954,19 +771,22 @@ function analyzeRecruitmentProcess(input: OpportunityInput): CategoryAnalysis {
   };
 }
 
-function analyzeBrandImpersonation(input: OpportunityInput): CategoryAnalysis {
+/**
+ * A brand reaches this function only as a verified BrandFact (word-boundary,
+ * proper-noun, not a tool name like "Google Meet", not inside a URL — see
+ * extractBrands in facts.ts). If no BrandFact exists, no finding can name one.
+ */
+function analyzeBrandImpersonation(facts: CanonicalFacts, fx: FindingFactory): CategoryAnalysis {
   const findings: Finding[] = [];
   const positives: Finding[] = [];
   const gaps: string[] = [];
   let scoreContribution = 0;
 
-  const text = `${input.company} ${input.description} ${input.recruiterMessage} ${input.offerLetter}`;
-  const lower = text.toLowerCase();
+  const brand = facts.brands[0];
+  const gov = signalsOf(facts, 'gov_claim');
+  const govFound = phrasesOf(gov);
 
-  const brandFound = BRAND_NAMES.find((b) => lower.includes(b));
-  const govFound = GOVERNMENT_KEYWORDS.filter((k) => lower.includes(k));
-
-  if (!brandFound && govFound.length === 0) {
+  if (!brand && govFound.length === 0) {
     return {
       category: 'Brand / Government Affiliation',
       status: 'partial', confidence: 'medium', riskLevel: 'low',
@@ -974,53 +794,53 @@ function analyzeBrandImpersonation(input: OpportunityInput): CategoryAnalysis {
     };
   }
 
-  if (brandFound) {
-    const emailDomain = input.recruiterEmail.trim() ? getDomainFromEmail(input.recruiterEmail) : null;
-    if (emailDomain && FREE_EMAIL_PROVIDERS.has(emailDomain)) {
-      findings.push({
-        id: nextId(),
+  const email = facts.recruiterEmail;
+  const website = facts.website;
+
+  if (brand) {
+    const emailDomain = email ? getDomainFromEmail(email.value) : null;
+    if (email && emailDomain && FREE_EMAIL_PROVIDERS.has(emailDomain)) {
+      if (fx.add(findings, {
         category: 'brand',
         severity: 'high',
         title: 'Affiliation could not be independently verified',
-        finding: `The opportunity claims affiliation with "${brandFound}" but the recruiter uses a personal email.`,
-        evidence: `Brand: ${brandFound}, Email: ${input.recruiterEmail}`,
+        finding: `The opportunity claims affiliation with "${brand.value}" but the recruiter uses a personal email.`,
+        evidence: `Brand: ${brand.value}, Email: ${email.value}`,
         explanation: 'Recruiters from major brands typically use official company email. The affiliation could not be independently verified.',
         action: 'Contact the company through its official website to verify this relationship.',
-      });
-      scoreContribution += 15;
+        cites: cite(brand, email),
+      })) scoreContribution += 15;
     } else {
-      gaps.push(`Relationship with "${brandFound}" could not be independently verified`);
+      fx.gap(gaps, `Relationship with "${brand.value}" could not be independently verified`, cite(brand));
     }
   }
 
   if (govFound.length > 0) {
-    findings.push({
-      id: nextId(),
+    if (fx.add(findings, {
       category: 'brand',
       severity: 'caution',
       title: 'Government affiliation claim detected',
       finding: 'The opportunity claims a government, MSME, or AICTE affiliation.',
-      evidence: govFound.slice(0, 2).map((k) => `"${k}"`).join(', '),
+      evidence: quoted(govFound.slice(0, 2)),
       explanation: 'Government affiliation claims should be independently verified through official government portals. Do not assume the claim is accurate.',
       action: 'Verify the affiliation through the relevant official government or regulatory website.',
-    });
-    scoreContribution += 10;
+      cites: gov,
+    })) scoreContribution += 10;
   }
 
-  if (brandFound && input.companyWebsite.trim()) {
-    const domain = getDomainFromUrl(input.companyWebsite);
-    if (domain && !domain.includes(brandFound.slice(0, 4))) {
-      findings.push({
-        id: nextId(),
+  if (brand && website) {
+    const domain = getDomainFromUrl(website.value);
+    if (domain && !domain.includes(brand.value.slice(0, 4))) {
+      if (fx.add(findings, {
         category: 'brand',
         severity: 'high',
         title: 'Brand name does not match website domain',
-        finding: `The opportunity claims affiliation with "${brandFound}" but the website does not match.`,
-        evidence: `Brand: ${brandFound}, Website: ${input.companyWebsite}`,
+        finding: `The opportunity claims affiliation with "${brand.value}" but the website does not match.`,
+        evidence: `Brand: ${brand.value}, Website: ${website.value}`,
         explanation: 'A mismatch between a claimed brand affiliation and the website domain is a significant red flag for impersonation.',
         action: 'Verify the brand\'s official website independently and compare.',
-      });
-      scoreContribution += 15;
+        cites: cite(brand, website),
+      })) scoreContribution += 15;
     }
   }
 
@@ -1033,13 +853,14 @@ function analyzeBrandImpersonation(input: OpportunityInput): CategoryAnalysis {
   };
 }
 
-function analyzeOfferLetter(input: OpportunityInput): CategoryAnalysis {
+function analyzeOfferLetter(facts: CanonicalFacts, fx: FindingFactory): CategoryAnalysis {
   const findings: Finding[] = [];
   const positives: Finding[] = [];
   const gaps: string[] = [];
   let scoreContribution = 0;
 
-  if (!input.offerLetter.trim()) {
+  const offerDoc = facts.documents.find((d) => d.value === 'offerLetter');
+  if (!offerDoc) {
     gaps.push('No offer letter text was provided');
     return {
       category: 'Offer Letter Analysis',
@@ -1048,12 +869,14 @@ function analyzeOfferLetter(input: OpportunityInput): CategoryAnalysis {
     };
   }
 
-  const text = input.offerLetter;
-  const lower = text.toLowerCase();
+  const inOffer = (k: Parameters<typeof signalsOf>[1], includeNegated = false) =>
+    signalsOf(facts, k, { field: 'offerLetter', includeNegated });
 
-  if (!lower.includes('date')) {
-    findings.push({
-      id: nextId(),
+  // "candidate" and "update" contain the letters d-a-t-e; facts.ts only emits
+  // offer_date for the word "date"/"dated" or a real calendar date.
+  const dates = inOffer('offer_date');
+  if (dates.length === 0) {
+    if (fx.add(findings, {
       category: 'offer',
       severity: 'caution',
       title: 'Missing date in offer letter',
@@ -1061,27 +884,25 @@ function analyzeOfferLetter(input: OpportunityInput): CategoryAnalysis {
       evidence: 'No date reference detected',
       explanation: 'Legitimate offer letters typically include the date of issuance.',
       action: 'Ask for a dated offer letter on company letterhead.',
-    });
-    scoreContribution += 5;
+      cites: cite(offerDoc),
+    })) scoreContribution += 5;
   }
 
-  if (input.company.trim() && !lower.includes(input.company.toLowerCase())) {
-    findings.push({
-      id: nextId(),
+  if (facts.company && signalsOf(facts, 'offer_names_company').length === 0) {
+    if (fx.add(findings, {
       category: 'offer',
       severity: 'caution',
       title: 'Company name not mentioned in offer letter',
       finding: 'The claimed company name does not appear in the offer letter text.',
-      evidence: `Expected "${input.company}" in offer letter`,
+      evidence: `Expected "${facts.company.value}" in offer letter`,
       explanation: 'A legitimate offer letter should reference the employer\'s name.',
       action: 'Ask for an offer letter on official company letterhead.',
-    });
-    scoreContribution += 8;
+      cites: cite(facts.company, offerDoc),
+    })) scoreContribution += 8;
   }
 
-  if (!lower.includes('salary') && !lower.includes('stipend') && !lower.includes('compensation') && !lower.includes('pay')) {
-    findings.push({
-      id: nextId(),
+  if (inOffer('offer_compensation_term').length === 0) {
+    if (fx.add(findings, {
       category: 'offer',
       severity: 'caution',
       title: 'Missing compensation information',
@@ -1089,44 +910,44 @@ function analyzeOfferLetter(input: OpportunityInput): CategoryAnalysis {
       evidence: 'No compensation keywords detected',
       explanation: 'A legitimate offer letter should clearly state compensation details.',
       action: 'Request a written offer with clear compensation details.',
-    });
-    scoreContribution += 5;
+      cites: cite(offerDoc),
+    })) scoreContribution += 5;
   }
 
-  const genericPhrases = ['dear candidate', 'dear applicant', 'congratulations on being selected', 'we are pleased to offer'];
-  const genericHits = containsAny(lower, genericPhrases);
+  const template = inOffer('template_phrase');
+  const genericHits = phrasesOf(template);
   if (genericHits.length >= 2) {
-    findings.push({
-      id: nextId(),
+    if (fx.add(findings, {
       category: 'offer',
       severity: 'caution',
       title: 'Generic/template language detected',
       finding: 'Several responsibilities are described broadly without identifying a specific project, team, manager, or deliverable.',
-      evidence: genericHits.map((k) => `"${k}"`).join(', '),
+      evidence: quoted(genericHits),
       explanation: 'Heavy use of generic boilerplate language can indicate a template-based offer rather than a genuine, role-specific letter.',
       action: 'Request a detailed offer letter with specific role and project information.',
-    });
-    scoreContribution += 8;
+      cites: template,
+    })) scoreContribution += 8;
   }
 
-  const paymentHits = containsAny(text, PAYMENT_DEMAND_KEYWORDS);
-  if (paymentHits.length > 0) {
-    findings.push({
-      id: nextId(),
+  // Direction-aware: only a candidate→company payment inside the offer letter itself.
+  const offerDemands = paymentsOf(facts, 'candidate_pays').filter((p) => p.span.field === 'offerLetter');
+  if (offerDemands.length > 0) {
+    const cues = Array.from(new Set(offerDemands.flatMap((d) => (d.purpose ? [d.purpose] : d.cues))));
+    if (fx.add(findings, {
       category: 'offer',
       severity: 'critical',
       title: 'Payment requirement in offer letter',
       finding: 'The offer letter contains a payment or deposit requirement.',
-      evidence: paymentHits.slice(0, 3).map((k) => `"${k}"`).join(', '),
+      evidence: quoted(cues.slice(0, 3)),
       explanation: 'Payment requirements in an offer letter are a major red flag.',
       action: 'Do not pay any amount. Verify the company independently first.',
-    });
-    scoreContribution += 20;
+      cites: offerDemands,
+    })) scoreContribution += 20;
   }
 
-  if (hasNonNegatedMention(text, 'salary') || hasNonNegatedMention(text, 'stipend')) {
-    positives.push({
-      id: nextId(),
+  const comp = inOffer('salary_or_stipend');
+  if (comp.length > 0) {
+    fx.add(positives, {
       category: 'offer',
       severity: 'positive',
       title: 'Compensation details included',
@@ -1134,12 +955,12 @@ function analyzeOfferLetter(input: OpportunityInput): CategoryAnalysis {
       evidence: 'Compensation keywords detected',
       explanation: 'Including compensation details is a positive signal.',
       action: 'Verify the compensation is realistic for the role and market.',
+      cites: cite(comp[0]),
     });
   }
 
-  if (lower.includes('date') && lower.includes('date')) {
-    positives.push({
-      id: nextId(),
+  if (dates.length > 0) {
+    fx.add(positives, {
       category: 'offer',
       severity: 'positive',
       title: 'Offer letter appears structured',
@@ -1147,6 +968,7 @@ function analyzeOfferLetter(input: OpportunityInput): CategoryAnalysis {
       evidence: 'Date and structured format detected',
       explanation: 'A structured offer letter is more reassuring than a casual message.',
       action: 'Still verify the letterhead and company independently.',
+      cites: cite(dates[0]),
     });
   }
 
@@ -1159,78 +981,93 @@ function analyzeOfferLetter(input: OpportunityInput): CategoryAnalysis {
   };
 }
 
-/**
- * Non-negated hits for one bucket, e.g. NOT "we never ask for your Aadhaar".
- * Uses a wider negation window than the default: sensitive-info disclaimers
- * commonly negate a whole list from one lead word ("We never ask for your
- * Aadhaar, bank details, or a photograph"), so the negation can sit further
- * back from a later item than the default 25-char window allows.
- */
-function bucketHits(text: string, keywords: string[]): string[] {
-  return keywords.filter((kw) => hasNonNegatedMention(text, kw, 60));
-}
-
-function analyzeSensitiveInfo(input: OpportunityInput): CategoryAnalysis {
+function analyzeSensitiveInfo(facts: CanonicalFacts, fx: FindingFactory): CategoryAnalysis {
   const findings: Finding[] = [];
   const gaps: string[] = [];
   let scoreContribution = 0;
 
-  const text = `${input.description} ${input.recruiterMessage} ${input.offerLetter}`;
+  // Negation ("we never ask for your Aadhaar") is resolved per mention in
+  // facts.ts with a 60-char window; negated mentions are excluded here.
+  const govId = signalsOf(facts, 'sens_gov_id');
+  const financial = signalsOf(facts, 'sens_financial');
+  // Generic "ID proof" only counts when nothing more specific matched, so one
+  // request is never counted under two labels.
+  const genericId = govId.length === 0 ? signalsOf(facts, 'sens_gov_id_generic') : [];
+  // "Photo ID" names the identity document itself (reported under Government ID
+  // above), not a separate photograph - one request, one label. A genuinely
+  // separate photograph request ("ID and a passport-size photograph") is kept.
+  const photo = signalsOf(facts, 'sens_photo')
+    .filter((s) => !((govId.length > 0 || genericId.length > 0) && s.phrase.toLowerCase() === 'photo id'));
 
-  const governmentIdHits = bucketHits(text, SENSITIVE_INFO_KEYWORD_MAP.governmentId);
-  const financialHits = bucketHits(text, SENSITIVE_INFO_KEYWORD_MAP.financial);
-  const photographHits = bucketHits(text, SENSITIVE_INFO_KEYWORD_MAP.photograph);
-  // Only counts if nothing specific already matched — see GENERIC_ID_PHRASES.
-  const genericIdHits = governmentIdHits.length === 0
-    ? bucketHits(text, GENERIC_ID_PHRASES)
-    : [];
+  if (govId.length > 0 || genericId.length > 0) {
+    const hits = govId.length > 0 ? govId : genericId;
 
-  if (governmentIdHits.length > 0 || genericIdHits.length > 0) {
-    const evidence = (governmentIdHits.length > 0 ? governmentIdHits : genericIdHits)
-      .slice(0, 3).map((k) => `"${k}"`).join(', ');
-    findings.push({
-      id: nextId(),
+    // Severity follows timing and context, never a document's name alone.
+    // Routine = EVERY mention is explicit post-selection onboarding AND the text
+    // has none of the suspicious signals already extracted by the facts layer
+    // (coercive pressure, messaging-app channel, candidate payment, financial
+    // details, offer without interview, unrealistic promises). Application-stage,
+    // unspecified timing, or any suspicious context keeps it critical.
+    const suspiciousContext =
+      signalsOf(facts, 'pressure').length > 0 ||
+      signalsOf(facts, 'messaging_platform').length > 0 ||
+      signalsOf(facts, 'sens_financial').length > 0 ||
+      signalsOf(facts, 'no_interview').length > 0 ||
+      signalsOf(facts, 'instant_selection').length > 0 ||
+      signalsOf(facts, 'scam_promise').length > 0 ||
+      paymentsOf(facts, 'candidate_pays').length > 0;
+    const routine = !suspiciousContext && hits.every((h) => h.idContext?.stage === 'post_selection');
+
+    // Say only what was actually requested - never "ID number" for a document.
+    const forms = new Set(hits.map((h) => h.idContext?.form ?? 'unspecified'));
+    const askedFor = forms.has('number') && forms.has('document') ? 'a government-issued identity document and an ID number'
+      : forms.has('number') ? 'a government-issued ID number'
+      : forms.has('document') ? 'a government-issued identity document'
+      : 'a government-issued identity credential (the posting does not say whether a number or a copy of the document is wanted)';
+
+    if (fx.add(findings, {
       category: 'sensitive',
-      severity: 'critical',
+      severity: routine ? 'caution' : 'critical',
       title: 'Government ID requested',
-      finding: 'The opportunity asks for a government-issued identity document or ID number.',
-      evidence,
-      explanation: 'Requests for a government ID (Aadhaar, PAN, passport, driving license, voter ID) before the employer is verified are a significant warning sign — these documents enable identity theft.',
-      action: 'Do not share government ID documents or numbers until the employer is independently verified.',
-    });
-    scoreContribution += 20;
+      finding: `The opportunity asks for ${askedFor}.`,
+      evidence: quoted(phrasesOf(hits).slice(0, 3)),
+      explanation: routine
+        ? 'Collecting identity documents from selected candidates before they start is common practice, so on its own this is not a sign of fraud. These documents do enable identity theft if they reach the wrong party, so confirm the employer first and send them only through a channel you have verified.'
+        : 'Requests for a government ID (Aadhaar, PAN, passport, driving license, voter ID) before the employer is verified are a significant warning sign — these documents enable identity theft.',
+      action: routine
+        ? 'Confirm the employer is genuine, and that the request really comes from them, before sending any ID document or number.'
+        : 'Do not share government ID documents or numbers until the employer is independently verified.',
+      cites: hits,
+    })) scoreContribution += routine ? 8 : 20;
   }
 
-  if (financialHits.length > 0) {
-    findings.push({
-      id: nextId(),
+  if (financial.length > 0) {
+    if (fx.add(findings, {
       category: 'sensitive',
       severity: 'critical',
       title: 'Bank or financial account details requested',
       finding: 'The opportunity asks for bank account, card, or other financial access details.',
-      evidence: financialHits.slice(0, 3).map((k) => `"${k}"`).join(', '),
+      evidence: quoted(phrasesOf(financial).slice(0, 3)),
       explanation: 'No legitimate employer needs your bank account number, card details, or PINs before or during hiring.',
       action: 'Never share bank details, card numbers, CVV, or PINs with a recruiter.',
-    });
-    scoreContribution += 20;
+      cites: financial,
+    })) scoreContribution += 20;
   }
 
-  if (photographHits.length > 0) {
-    findings.push({
-      id: nextId(),
+  if (photo.length > 0) {
+    if (fx.add(findings, {
       category: 'sensitive',
       severity: 'caution',
       title: 'Photograph requested',
       finding: 'The opportunity asks for a passport-size photograph.',
-      evidence: photographHits.slice(0, 3).map((k) => `"${k}"`).join(', '),
+      evidence: quoted(phrasesOf(photo).slice(0, 3)),
       explanation: 'A photo alone is commonly requested by legitimate employers for ID badges or profile records, and is not on its own a sign of fraud. Treat it as routine unless paired with a government ID or payment request.',
       action: 'A photo request alone is not a red flag — but avoid sending one alongside government ID or payment.',
-    });
-    scoreContribution += 3;
+      cites: photo,
+    })) scoreContribution += 3;
   }
 
-  const anyHit = governmentIdHits.length > 0 || genericIdHits.length > 0
-    || financialHits.length > 0 || photographHits.length > 0;
+  const anyHit = govId.length > 0 || genericId.length > 0 || financial.length > 0 || photo.length > 0;
 
   return {
     category: 'Sensitive Information',
@@ -1241,56 +1078,51 @@ function analyzeSensitiveInfo(input: OpportunityInput): CategoryAnalysis {
   };
 }
 
-function assessOpportunityQuality(input: OpportunityInput): OpportunityQuality {
+/** Qualitative notes — every conclusion is backed by a fact actually present, never by a missing buzzword. */
+function assessOpportunityQuality(facts: CanonicalFacts): OpportunityQuality {
   const notes: string[] = [];
-  const text = `${input.description} ${input.recruiterMessage} ${input.offerLetter}`;
-  const lower = text.toLowerCase();
-
   let qualityScore = 0;
+  const has = (k: Parameters<typeof signalsOf>[1], includeNegated = false) =>
+    signalsOf(facts, k, { includeNegated }).length > 0;
 
-  if (text.trim().length < 50) {
+  if (facts.textChars < 50) {
     notes.push('Job description is very brief — unclear responsibilities.');
     qualityScore -= 1;
   } else {
     notes.push('Job description provides some detail.');
   }
 
-  if (lower.includes('mentor') || lower.includes('mentorship')) {
+  if (has('mentorship')) {
     notes.push('Mentorship is mentioned.');
     qualityScore += 1;
   }
-  // Absence of a mentorship mention is not penalized — most legitimate
-  // postings simply don't use that specific word, and its absence isn't
-  // evidence of anything. Every qualitative conclusion here should be
-  // backed by something actually present in the text, not by a missing
-  // buzzword.
 
-  if (containsAny(text, COMPENSATION_CONTEXT_PATTERNS).length > 0) {
+  if (has('comp_context')) {
     notes.push('Compensation details are clearly described.');
     qualityScore += 1;
   }
 
-  if (lower.includes('certificate') && !lower.includes('salary') && !lower.includes('stipend')) {
+  if (has('certificate') && !has('salary_or_stipend', true)) {
     notes.push('The opportunity appears to be certificate-focused without compensation.');
     qualityScore -= 2;
   }
 
-  if (lower.includes('unpaid') || (lower.includes('no stipend') || lower.includes('no salary'))) {
+  if (has('unpaid')) {
     notes.push('The opportunity may be unpaid.');
     qualityScore -= 1;
   }
 
-  if (lower.includes('sales target') || lower.includes('fundraising') || lower.includes('raise funds')) {
+  if (has('sales_target')) {
     notes.push('Sales or fundraising targets are mentioned — may indicate revenue-dependent role.');
     qualityScore -= 1;
   }
 
-  if (lower.includes('project') && (lower.includes('team') || lower.includes('manager'))) {
+  if (has('project') && has('team_or_manager')) {
     notes.push('Specific project/team context is described.');
     qualityScore += 1;
   }
 
-  if (hasNonNegatedMention(text, 'interview') || hasNonNegatedMention(text, 'assessment')) {
+  if (has('interview') || has('assessment')) {
     notes.push('A structured selection process is described.');
     qualityScore += 1;
   }
@@ -1444,195 +1276,164 @@ export function toPublicResult(result: AnalysisResult, tier: PreviewTier = 'stan
  * analyzer — everything else stays fast, synchronous, and independently
  * testable.
  */
-async function applyDomainAgeSignal(input: OpportunityInput, companyCategory: CategoryAnalysis): Promise<void> {
-  if (!input.companyWebsite.trim()) return;
-  const domain = getDomainFromUrl(input.companyWebsite);
-  if (!domain) return;
+function applyDomainAgeSignal(facts: CanonicalFacts, fx: FindingFactory, companyCategory: CategoryAnalysis): void {
+  const website = facts.website;
+  if (!website || !getDomainFromUrl(website.value)) return;
+  const domain = getDomainFromUrl(website.value)!;
 
-  const result = await lookupDomainAge(domain);
-
-  if (result.status === 'unable_to_verify') {
+  const obs = facts.observations.find((o) => o.probe === 'domain_age');
+  if (!obs || obs.outcome !== 'known' || obs.ageDays == null) {
     companyCategory.gaps.push('Domain registration date');
     return;
   }
 
-  const { ageDays } = result;
-  if (ageDays === null) return;
+  const ageDays = obs.ageDays;
+  const registeredDate = obs.registeredDate;
 
   if (ageDays < 30) {
-    companyCategory.findings.push({
-      id: nextId(),
+    if (fx.add(companyCategory.findings, {
       category: 'company',
       severity: 'high',
       title: `Website domain "${domain}" was registered ${ageDays} day${ageDays !== 1 ? 's' : ''} ago`,
       finding: `The website domain was registered very recently (${ageDays} day${ageDays !== 1 ? 's' : ''} ago).`,
-      evidence: `Domain age: ${ageDays} days (registered ${result.registeredDate})`,
+      evidence: `Domain age: ${ageDays} days (registered ${registeredDate})`,
       explanation: 'This increases uncertainty and should be verified alongside other signals. A new legitimate business can have a new domain — this alone is not proof of anything.',
       action: 'Independently verify the company through other channels before proceeding.',
-    });
-    companyCategory.scoreContribution += 18;
+      cites: cite(website, obs),
+    })) companyCategory.scoreContribution += 18;
   } else if (ageDays < 180) {
-    companyCategory.findings.push({
-      id: nextId(),
+    if (fx.add(companyCategory.findings, {
       category: 'company',
       severity: 'caution',
       title: `Website domain "${domain}" is ${ageDays} days old`,
       finding: `The website domain was registered ${ageDays} days ago.`,
-      evidence: `Domain age: ${ageDays} days (registered ${result.registeredDate})`,
+      evidence: `Domain age: ${ageDays} days (registered ${registeredDate})`,
       explanation: 'A newer domain is not evidence of fraud on its own, but it is a mild signal worth weighing alongside everything else.',
       action: 'Cross-check the company through other independent sources.',
-    });
-    companyCategory.scoreContribution += 8;
+      cites: cite(website, obs),
+    })) companyCategory.scoreContribution += 8;
   } else if (ageDays > 365) {
-    companyCategory.positives.push({
-      id: nextId(),
+    fx.add(companyCategory.positives, {
       category: 'company',
       severity: 'positive',
       title: `Website domain has been registered for over a year`,
       finding: `The website domain was registered ${Math.floor(ageDays / 365)}+ year(s) ago.`,
-      evidence: `Domain age: ${ageDays} days (registered ${result.registeredDate})`,
+      evidence: `Domain age: ${ageDays} days (registered ${registeredDate})`,
       explanation: 'An established domain age is a mild positive signal, though still not independent proof of legitimacy.',
       action: 'Continue verifying other details as normal.',
+      cites: cite(website, obs),
     });
   }
-  // 180-365 days: neutral, no finding either way — matches the checklist's
-  // explicit "180+ days -> no domain-age warning" rule without overclaiming
-  // a positive for a domain that's merely not brand-new.
+  // 180-365 days: neutral, no finding either way.
 
   companyCategory.riskLevel = companyCategory.scoreContribution > 15 ? 'high' : companyCategory.scoreContribution > 5 ? 'caution' : 'low';
 }
 
 /**
- * Actually visits the claimed website to confirm something real is
- * running there — RDAP only confirms the domain is *registered*, which
- * is a different fact from a site actually existing and responding.
+ * Reads the website-reachability OBSERVATION (made in extractFacts, where a
+ * negative result is only reported as evidence if the probe could observe at
+ * all). One failed GET is weak evidence about a company, so:
+ *   reachable      → positive.
+ *   dns_not_found  → the name does not resolve (and a control probe proved the
+ *                    observer's DNS works): a CAUTION, not a major warning.
+ *   inconclusive   → timeouts / TLS / blocks / offline observer: a verification
+ *                    gap only. It says nothing about the company.
  */
-async function applyWebsiteReachabilitySignal(input: OpportunityInput, companyCategory: CategoryAnalysis): Promise<void> {
-  if (!input.companyWebsite.trim()) return;
+function applyWebsiteReachabilitySignal(facts: CanonicalFacts, fx: FindingFactory, companyCategory: CategoryAnalysis): void {
+  const website = facts.website;
+  if (!website) return;
 
-  const result = await checkWebsiteReachable(input.companyWebsite);
-
-  if (result.status === 'unable_to_verify') {
+  const obs = facts.observations.find((o) => o.probe === 'website_reachability');
+  if (!obs || obs.outcome === 'inconclusive') {
     companyCategory.gaps.push('Whether the website URL is well-formed and reachable');
     return;
   }
 
-  if (result.status === 'unreachable') {
-    companyCategory.findings.push({
-      id: nextId(),
+  if (obs.outcome === 'dns_not_found') {
+    if (fx.add(companyCategory.findings, {
       category: 'company',
-      severity: 'high',
-      title: `Website "${input.companyWebsite.trim()}" could not be reached`,
-      finding: 'The claimed company website did not respond to a direct request — it may not exist, may be misspelled, or may not be currently online.',
-      evidence: `Attempted to reach: ${input.companyWebsite.trim()}`,
-      explanation: 'A company claiming an official website that does not actually respond is a meaningful red flag — this is different from, and more concrete than, the domain simply being new.',
-      action: 'Independently search for the company\'s real website before proceeding. Do not trust a link sent to you without verifying it separately.',
-    });
-    companyCategory.scoreContribution += 22;
+      severity: 'caution',
+      tag: 'company.website_unreachable',
+      title: `Website "${website.value}" did not resolve`,
+      finding: 'The domain name of the claimed company website could not be found, so no server could be reached.',
+      evidence: `DNS lookup for ${website.value} returned "not found"`,
+      explanation: 'A web address that does not resolve is worth checking — it is often a typo in a link — but a single automated check is not proof of a fake company, so this is a caution rather than a major warning.',
+      action: 'Check the spelling of the website and search for the company\'s real site independently.',
+      cites: cite(website, obs),
+    })) companyCategory.scoreContribution += 8;
     companyCategory.riskLevel = companyCategory.scoreContribution > 15 ? 'high' : companyCategory.scoreContribution > 5 ? 'caution' : 'low';
     return;
   }
 
-  // "Reachable" includes any real HTTP response, even an error status —
-  // that still proves a real server answered, which is the actual fact
-  // being checked here (not whether the page itself looks good).
-  companyCategory.positives.push({
-    id: nextId(),
+  // "Reachable" includes any real HTTP response, even an error status — that
+  // still proves a real server answered, which is the fact being checked.
+  fx.add(companyCategory.positives, {
     category: 'company',
     severity: 'positive',
+    tag: 'company.website_reachable',
     title: 'Company website is live and reachable',
     finding: 'The claimed company website responded to a direct request.',
-    evidence: `${input.companyWebsite.trim()} responded${result.httpStatus ? ` (HTTP ${result.httpStatus})` : ''}`,
+    evidence: `${website.value} responded${obs.httpStatus ? ` (HTTP ${obs.httpStatus})` : ''}`,
     explanation: 'This confirms a real server exists at this address — it does not by itself confirm the site or company are legitimate.',
     action: 'Continue verifying other details as normal.',
+    cites: cite(website, obs),
   });
 }
 
 export interface AnalyzeOptions {
   /**
-   * Enables the LLM extraction layer as a fallback for whatever the fast,
-   * free, deterministic extractors in extract.ts couldn't find (e.g. a
-   * recruiter name mentioned in prose rather than a labelled "Recruiter:"
-   * line). Deterministic extraction always runs first and always wins if
-   * it succeeds — the LLM is only consulted for a field still missing
-   * afterward. If omitted, undefined, or the call fails for any reason,
-   * behavior is identical to not having this layer at all.
+   * Enables the LLM extractor as a fallback for a company/recruiter name the
+   * deterministic extractors couldn't find. The LLM only proposes CANDIDATES
+   * (value + verbatim quote); facts.ts accepts one only if the quote is found
+   * in the real text and contains the value. If omitted or failing, the field
+   * simply stays UNKNOWN.
    */
   llmApiKey?: string;
+  /** Test seam: replaces the network LLM call. */
+  llmExtractor?: (text: string) => Promise<LlmExtractionResult>;
+  /** Test seam: replaces the website / domain-age probes (which run inside extractFacts). */
+  probes?: ExtractOptions['probes'];
+  /** Called whenever the finding factory drops a finding for citing unsupported facts. */
+  onIntegrityViolation?: (v: IntegrityViolation) => void;
 }
 
 export async function analyzeOpportunity(input: OpportunityInput, options: AnalyzeOptions = {}): Promise<AnalysisResult> {
-  findingCounter = 0;
+  // The ONE read of the raw input. Everything below sees only verified facts.
+  const facts = await extractFacts(input, { llmApiKey: options.llmApiKey, llmExtractor: options.llmExtractor, probes: options.probes });
+  const fx = new FindingFactory(facts, options.onIntegrityViolation);
 
-  let effectiveInput = input;
-  let inferredCompanyFinding: Finding | null = null;
-  let recruiterNameExtracted = false;
-
-  const combinedText = `${input.recruiterMessage}\n${input.description}\n${input.offerLetter}`;
-
-  // Deterministic pass first — free, instant, already tested (see
-  // scripts/test-extract.mts). The LLM is only ever consulted for
-  // whichever of these two fields is STILL missing afterward.
-  let inferredCompany = !input.company.trim()
-    ? (inferCompanyName(combinedText) ?? inferCompanyNameFromWebsite(input.companyWebsite))
-    : null;
-  let inferredRecruiterName = !input.recruiterName.trim()
-    ? inferRecruiterName(combinedText)
-    : null;
-
-  let companySource: 'llm' | 'deterministic' = 'deterministic';
-  const stillNeedsCompany = !input.company.trim() && !inferredCompany;
-  const stillNeedsRecruiterName = !input.recruiterName.trim() && !inferredRecruiterName;
-  if (options.llmApiKey && (stillNeedsCompany || stillNeedsRecruiterName)) {
-    const llmResult = await extractWithLlm(combinedText, options.llmApiKey);
-    if (llmResult.usedLlm) {
-      if (stillNeedsCompany && llmResult.company) {
-        inferredCompany = llmResult.company;
-        companySource = 'llm';
-      }
-      if (stillNeedsRecruiterName && llmResult.recruiterName) {
-        inferredRecruiterName = llmResult.recruiterName;
-      }
-    }
-  }
-
-  if (inferredCompany) {
-    effectiveInput = { ...effectiveInput, company: inferredCompany };
-    inferredCompanyFinding = {
-      id: nextId(),
-      category: 'company',
-      severity: 'positive',
-      title: `Company identified: "${inferredCompany}"`,
-      finding: `A company name was not explicitly entered, but "${inferredCompany}" was identified from the submitted text${input.companyWebsite.trim() ? ' or website' : ''}.`,
-      evidence: inferredCompany,
-      explanation: companySource === 'llm'
-        ? 'This was extracted by an AI reading pass, not a manual entry — worth double-checking it matches the actual company before relying on it.'
-        : 'This is a best-effort extraction, not a manual entry — worth double-checking it matches the actual company before relying on it.',
-      action: 'Confirm this is the correct company name.',
-    };
-  }
-
-  if (inferredRecruiterName) {
-    effectiveInput = { ...effectiveInput, recruiterName: inferredRecruiterName };
-    recruiterNameExtracted = true;
-  }
-
-  const companyCategory = analyzeCompany(effectiveInput);
-  if (inferredCompanyFinding) companyCategory.positives.push(inferredCompanyFinding);
-  await applyDomainAgeSignal(effectiveInput, companyCategory);
-  await applyWebsiteReachabilitySignal(effectiveInput, companyCategory);
+  const companyCategory = analyzeCompany(facts, fx);
+  applyDomainAgeSignal(facts, fx, companyCategory);
+  applyWebsiteReachabilitySignal(facts, fx, companyCategory);
 
   const categories: CategoryAnalysis[] = [
     companyCategory,
-    analyzeRecruiterIdentity(effectiveInput, recruiterNameExtracted),
-    analyzeEmailDomain(effectiveInput),
-    analyzeJobPosting(effectiveInput),
-    analyzePayment(`${effectiveInput.offerLetter} ${effectiveInput.recruiterMessage} ${effectiveInput.description}`),
-    analyzeRecruitmentProcess(effectiveInput),
-    analyzeBrandImpersonation(effectiveInput),
-    analyzeOfferLetter(effectiveInput),
-    analyzeSensitiveInfo(effectiveInput),
+    analyzeRecruiterIdentity(facts, fx),
+    analyzeEmailDomain(facts, fx),
+    analyzeJobPosting(facts, fx),
+    analyzePayment(facts, fx),
+    analyzeRecruitmentProcess(facts, fx),
+    analyzeBrandImpersonation(facts, fx),
+    analyzeOfferLetter(facts, fx),
+    analyzeSensitiveInfo(facts, fx),
   ];
+
+  // Contradiction pass: runs on the fully assembled set, across every
+  // category, before anything (score, UI, summary) derives from the
+  // result. See contradictionValidator.ts for the resolution policy.
+  const { positives: resolvedPositives, notes: contradictionNotes } = resolveContradictions(
+    categories.flatMap((c) => c.findings),
+    categories.flatMap((c) => c.positives),
+  );
+  if (contradictionNotes.length > 0) {
+    const droppedIds = new Set(
+      categories.flatMap((c) => c.positives).filter((p) => !resolvedPositives.includes(p)).map((p) => p.id),
+    );
+    // Keep each category's own .positives array consistent with the resolved set.
+    for (const c of categories) {
+      c.positives = c.positives.filter((p) => !droppedIds.has(p.id));
+    }
+  }
 
   const allFindings = categories.flatMap((c) => c.findings);
   const allPositives = categories.flatMap((c) => c.positives);
@@ -1648,7 +1449,7 @@ export async function analyzeOpportunity(input: OpportunityInput, options: Analy
   const riskLevel = computeRiskLevel(score, majorWarnings);
   const summary = buildSummary(score, riskLevel, majorWarnings, cautionSignals);
   const recommendedAction = buildRecommendedAction(allFindings);
-  const opportunityQuality = assessOpportunityQuality(effectiveInput);
+  const opportunityQuality = assessOpportunityQuality(facts);
   const verificationConfidence = computeVerificationConfidence(categories);
 
   const categoryResults: CategoryResult[] = categories.map((c) => ({
@@ -1676,10 +1477,11 @@ export async function analyzeOpportunity(input: OpportunityInput, options: Analy
     opportunityQuality,
     recommendedAction,
     createdAt: new Date().toISOString(),
+    // From verified facts only — never from the raw input object.
     inputSummary: {
-      company: effectiveInput.company.trim() || undefined,
-      recruiterName: effectiveInput.recruiterName.trim() || undefined,
-      jobTitle: effectiveInput.jobTitle.trim() || undefined,
+      company: facts.company?.value,
+      recruiterName: facts.recruiterName?.value,
+      jobTitle: facts.jobTitle?.value,
     },
   };
 }

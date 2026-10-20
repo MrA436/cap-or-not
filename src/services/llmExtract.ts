@@ -1,21 +1,30 @@
 /**
- * PROVIDER: OpenRouter, model meta-llama/llama-3.1-8b-instruct:free.
+ * PROVIDER: OpenRouter, using the `openrouter/free` Free Models Router
+ * rather than a pinned individual model.
+ *
+ * WHY A ROUTER INSTEAD OF A PINNED MODEL: a specific free model was
+ * pinned here twice before (first deepseek/deepseek-r1-0528:free, then
+ * meta-llama/llama-3.1-8b-instruct:free) and both times the model was
+ * later removed from OpenRouter's free tier entirely — free models get
+ * rotated in and out of that tier on a timeline Anthropic/this codebase
+ * has no visibility into or control over. `openrouter/free` is
+ * OpenRouter's own router that auto-selects from whatever free models
+ * are CURRENTLY available, and explicitly filters for the features a
+ * request needs (OpenRouter's own docs name "structured outputs" as one
+ * of the filtered-for features, which is directly relevant here). This
+ * trades a small amount of response-quality/latency predictability
+ * (you don't know in advance which underlying model will answer a given
+ * call) for not needing another manual model swap next time a free
+ * model gets deprecated.
  *
  * OpenRouter uses an OpenAI-compatible /chat/completions endpoint, not
- * Anthropic's tool-use format — swapping to a different OpenRouter model,
- * or to a different OpenAI-compatible provider entirely, mostly means
- * changing MODEL and OPENROUTER_URL below. Swapping to a genuinely
- * different API shape (e.g. Anthropic, Gemini's native API) means
- * rewriting the fetch call.
+ * Anthropic's tool-use format. Swapping away from OpenRouter to a
+ * genuinely different provider/API shape means rewriting the fetch call.
  *
- * Previously used deepseek/deepseek-r1-0528:free (a reasoning model) —
- * switched away because R1's "thinking" pass made a trivial two-field
- * extraction take 10-60+ seconds on the free tier, which is a bad
- * trade-off for this task. Llama 3.1 8B is a plain instruct model:
- * responds in a couple seconds and never emits <think> reasoning text.
- * The <think>-stripping and code-fence-stripping logic below is kept
- * anyway, harmlessly, as defense against whatever model ends up here
- * next.
+ * Because the actual underlying model varies per call, this file makes
+ * NO assumption about whether a given response will or won't contain
+ * <think> reasoning blocks or markdown-fenced JSON — the parsing below
+ * strips both defensively regardless of which model answered.
  *
  * LLM extraction layer — an UPGRADE to, not a replacement for, the
  * deterministic extractors in extract.ts. Design rules, all load-bearing:
@@ -55,18 +64,36 @@
  */
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-const MODEL = 'meta-llama/llama-3.1-8b-instruct:free';
-const TIMEOUT_MS = 8000; // plain instruct model — should typically respond in 1-3s
+const MODEL = 'openrouter/free'; // router — see file header for why this isn't a pinned model
+// Deliberately aggressive. This call only fires at all for the MINORITY of
+// postings the deterministic extractor already missed on — see extract.ts —
+// so it was never meant to be the common path. A slow LLM response should
+// never make the whole report feel slow: past this cap, give up and return
+// the report without the enhancement rather than make the user wait. A
+// missed name (falls back to the "not provided" gap, same as if this layer
+// didn't exist) is a far smaller cost than a sluggish product right now.
+const TIMEOUT_MS = 3000;
 const MAX_INPUT_CHARS = 6000; // keep prompts small & cheap; long inputs are truncated, not rejected
 
 export interface LlmExtractionResult {
   recruiterName: string | null;
   company: string | null;
+  /**
+   * The verbatim quotes the values were read from. facts.ts re-locates each
+   * quote in the original fields to build a span; a value without a locatable
+   * quote never becomes a fact. The LLM output is a CANDIDATE, not a fact.
+   */
+  recruiterQuote: string | null;
+  companyQuote: string | null;
   /** True only if the API call completed and returned a usable response. */
   usedLlm: boolean;
 }
 
-const NULL_RESULT: LlmExtractionResult = { recruiterName: null, company: null, usedLlm: false };
+/** The safe UNKNOWN fallback: used for every failure mode. */
+export const UNKNOWN_LLM_RESULT: LlmExtractionResult = {
+  recruiterName: null, company: null, recruiterQuote: null, companyQuote: null, usedLlm: false,
+};
+const NULL_RESULT = UNKNOWN_LLM_RESULT;
 
 interface RawExtraction {
   recruiter_name: string | null;
@@ -94,6 +121,22 @@ Do not extract a name from a generic label like "HR Team", "Recruitment Departme
 /** Normalizes whitespace so a quote spanning a line-wrap still verifies. */
 function normalizeForCompare(s: string): string {
   return s.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/** Alphanumerics only, lowercased — "Ankit Sharma" ≈ "ANKIT  SHARMA". */
+function alnum(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * The extracted value must be derivable from its own quote. Without this a
+ * model could attach a real-but-unrelated quote to an invented value (the
+ * "known residual gap" in the header) and the quote check alone would pass.
+ */
+function valueInQuote(value: string | null | undefined, quote: string | null | undefined): boolean {
+  if (!value || !quote) return false;
+  const v = alnum(value);
+  return v.length >= 2 && alnum(quote).includes(v);
 }
 
 /** True only if `quote` genuinely appears in `sourceText` (whitespace-insensitive). */
@@ -179,14 +222,18 @@ export async function extractWithLlm(text: string, apiKey: string | undefined): 
 
     const raw = parsed as Partial<RawExtraction>;
 
-    const recruiterName = quoteVerifies(raw.recruiter_name_quote, truncated) && raw.recruiter_name
-      ? raw.recruiter_name.trim().slice(0, 100)
-      : null;
-    const company = quoteVerifies(raw.company_name_quote, truncated) && raw.company_name
-      ? raw.company_name.trim().slice(0, 200)
-      : null;
+    const recruiterOk = typeof raw.recruiter_name === 'string' && typeof raw.recruiter_name_quote === 'string'
+      && quoteVerifies(raw.recruiter_name_quote, truncated) && valueInQuote(raw.recruiter_name, raw.recruiter_name_quote);
+    const companyOk = typeof raw.company_name === 'string' && typeof raw.company_name_quote === 'string'
+      && quoteVerifies(raw.company_name_quote, truncated) && valueInQuote(raw.company_name, raw.company_name_quote);
 
-    return { recruiterName, company, usedLlm: true };
+    return {
+      recruiterName: recruiterOk ? raw.recruiter_name!.trim().slice(0, 100) : null,
+      recruiterQuote: recruiterOk ? raw.recruiter_name_quote!.trim() : null,
+      company: companyOk ? raw.company_name!.trim().slice(0, 200) : null,
+      companyQuote: companyOk ? raw.company_name_quote!.trim() : null,
+      usedLlm: true,
+    };
   } catch {
     // Network error, timeout, non-JSON response, anything — fail closed.
     return NULL_RESULT;

@@ -21,6 +21,20 @@ export interface Finding {
   evidence: string;
   explanation: string;
   action: string;
+  /**
+   * Stable, machine-readable identifier for this specific KIND of finding
+   * (e.g. 'process.no_interview'), distinct from `title`'s human-facing
+   * text, which can be reworded without breaking anything that depends on
+   * recognizing the finding. Optional — most findings don't need one.
+   * Currently consumed only by contradictionValidator.ts, to recognize
+   * specific finding pairs without fragile string-matching on `title`.
+   */
+  tag?: string;
+  /**
+   * Ids of the verified canonical facts (services/facts.ts) this finding is
+   * built from. Set only by FindingFactory; additive and ignored by the UI.
+   */
+  factIds?: string[];
 }
 
 export interface CategoryResult {
