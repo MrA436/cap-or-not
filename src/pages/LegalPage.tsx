@@ -1,7 +1,7 @@
 import { Link } from 'react-router-dom';
 import { Mail, ShieldCheck } from 'lucide-react';
 import { LEGAL } from '@/config/legal';
-import type { LegalContent } from '@/pages/legalContent';
+import type { LegalContent } from '@/pages/LegalContent';
 
 interface LegalPageProps {
   content: LegalContent;

@@ -7,7 +7,7 @@ import ResultPage from '@/pages/ResultPage';
 import HowItWorksPage from '@/pages/HowItWorksPage';
 import SEOPage from '@/pages/SEOPage';
 import LegalPage from '@/pages/LegalPage';
-import { termsContent, privacyContent, refundContent, contactContent } from '@/pages/legalContent';
+import { termsContent, privacyContent, refundContent, contactContent } from '@/pages/LegalContent';
 import NotFoundPage from '@/pages/NotFoundPage';
 import {
   isThisJobLegit,

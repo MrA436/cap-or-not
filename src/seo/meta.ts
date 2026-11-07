@@ -6,7 +6,7 @@ import {
   jobScamChecker,
 } from '@/pages/seoContent';
 import type { SEOContent } from '@/pages/SEOPage';
-import { termsContent, privacyContent, refundContent, contactContent } from '@/pages/legalContent';
+import { termsContent, privacyContent, refundContent, contactContent } from '@/pages/LegalContent';
 
 export const SITE_URL = 'https://capornot.com';
 
