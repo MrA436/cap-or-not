@@ -6,6 +6,8 @@ import CheckPage from '@/pages/CheckPage';
 import ResultPage from '@/pages/ResultPage';
 import HowItWorksPage from '@/pages/HowItWorksPage';
 import SEOPage from '@/pages/SEOPage';
+import LegalPage from '@/pages/LegalPage';
+import { termsContent, privacyContent, refundContent, contactContent } from '@/pages/legalContent';
 import NotFoundPage from '@/pages/NotFoundPage';
 import {
   isThisJobLegit,
@@ -76,6 +78,10 @@ export default function App() {
         <Route path="/is-this-recruiter-legit" element={<SEOPage content={isThisRecruiterLegit} />} />
         <Route path="/fake-internship-signs" element={<SEOPage content={fakeInternshipSigns} />} />
         <Route path="/job-scam-checker" element={<SEOPage content={jobScamChecker} />} />
+        <Route path="/terms" element={<LegalPage content={termsContent} />} />
+        <Route path="/privacy" element={<LegalPage content={privacyContent} />} />
+        <Route path="/refund-policy" element={<LegalPage content={refundContent} />} />
+        <Route path="/contact" element={<LegalPage content={contactContent} />} />
         <Route path="*" element={<NotFoundPage />} />
       </Routes>
     </Layout>

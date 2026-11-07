@@ -162,7 +162,16 @@ export const COMPRESSED_URGENCY = ['urgent', 'urgently', 'immediately', 'asap', 
 
 export const CONSEQUENCE_LEAD = /^\s*(?:otherwise|or else|failing which|else)\b/i;
 
-// ───────────── government-ID requests: WHEN it is asked, and WHAT ─────────────
+/** Abbreviations whose trailing "." must not end a clause ("Rs. 999", "Mr. Rao", "Ref No. 45"). Global: used with replace(). */
+export const MASKED_ABBREV =
+  /\b(?:Rs|Mr|Mrs|Ms|Dr|Sr|Jr|Pvt|vs|approx|Dept|Govt|e\.g|i\.e|No(?=\.\s*[\d:#]))\./gi;
+
+/** A consequence introduced by "or" inside the same clause: "pay in 2 hours or your seat will be cancelled". Not global: used with test(). */
+export const CONSEQUENCE_AFTER_OR =
+  /\b(?:or|otherwise|failing which)\b[^.!?;]{0,60}?\b(?:cancel\w*|forfeit\w*|withdrawn|revoked|rejected|terminated|void|lapse[ds]?|expire[ds]?|given to|offered to|reallocated|blocked|blacklist\w*|disqualif\w*|removed|lose|lost)\b/i;
+
+
+  // ───────────── government-ID requests: WHEN it is asked, and WHAT ─────────────
 export type IdStage = 'post_selection' | 'application' | 'unspecified';
 export type IdForm = 'number' | 'document' | 'unspecified';
 export interface IdContext { stage: IdStage; form: IdForm }

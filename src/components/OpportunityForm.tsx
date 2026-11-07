@@ -272,7 +272,9 @@ export default function OpportunityForm({ onSubmit, isAnalyzing }: OpportunityFo
           className="mt-0.5 w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
         />
         <span className="text-sm text-gray-600">
-          I understand that Cap or Not provides indicators, not a definitive scam determination.
+          I understand that Cap or Not provides indicators, not a definitive scam determination, and I agree to the{' '}
+          <a href="/terms" target="_blank" rel="noopener" className="underline hover:text-gray-900">Terms</a> and{' '}
+          <a href="/privacy" target="_blank" rel="noopener" className="underline hover:text-gray-900">Privacy Policy</a>.
         </span>
       </label>
 

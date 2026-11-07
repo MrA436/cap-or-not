@@ -1,5 +1,4 @@
-import { randomUUID } from 'node:crypto';
-import type {
+﻿import type {
   Finding,
   Severity,
   CategoryResult,
@@ -18,6 +17,7 @@ import {
   signalsOf,
   phrasesOf,
   paymentsOf,
+  isStrongDemand,
   type CanonicalFacts,
   type ExtractOptions,
   type Fact,
@@ -591,10 +591,14 @@ function analyzePayment(facts: CanonicalFacts, fx: FindingFactory): CategoryAnal
     };
   }
 
-  const demands = paymentsOf(facts, 'candidate_pays');
+  const allDemands = paymentsOf(facts, 'candidate_pays');
+  const demands = allDemands.filter(isStrongDemand);
+  const contested = allDemands.filter((d) => !isStrongDemand(d));
   const receives = paymentsOf(facts, 'candidate_receives');
 
-  const purposes = Array.from(new Set(demands.flatMap((d) => (d.purpose ? [d.purpose] : d.cues))));
+  // Evidence is the verified wording from the posting (a rules cue or the model's
+  // verified quote), never free text produced by a model.
+  const purposes = Array.from(new Set(demands.flatMap((d) => (d.cues.length > 0 ? d.cues : d.purpose ? [d.purpose] : []))));
   const demandAmounts = Array.from(new Set(demands.flatMap((d) => d.amounts)));
 
   if (demands.length > 0) {
@@ -622,6 +626,21 @@ function analyzePayment(facts: CanonicalFacts, fx: FindingFactory): CategoryAnal
       action: 'Do not pay or transfer any money until you have independently verified the opportunity through official company channels.',
       cites: demands,
     })) scoreContribution += 30;
+  } else if (contested.length > 0) {
+    // The model read this as a demand but the posting's own wording contains a
+    // negation or warning. Surfaced for a human to check, not asserted as a fact.
+    const amount = Array.from(new Set(contested.flatMap((d) => d.amounts)))[0];
+    if (fx.add(findings, {
+      category: 'payment',
+      severity: 'caution',
+      tag: 'payment.possible_demand',
+      title: amount ? `Possible payment request — ${amount.trim()}` : 'Possible payment request',
+      finding: 'A payment may be requested, but the wording is ambiguous or may be saying the opposite.',
+      evidence: quoted(Array.from(new Set(contested.flatMap((d) => d.cues))).slice(0, 2)),
+      explanation: 'This was flagged as a possible payment request, but the same text also contains wording that can mean no payment is required. Check the exact sentence.',
+      action: 'Ask the employer to confirm in writing whether any payment is expected before sharing money or details.',
+      cites: contested,
+    })) scoreContribution += 8;
   } else if (receives.length > 0) {
     fx.add(positives, {
       category: 'payment',
@@ -636,7 +655,7 @@ function analyzePayment(facts: CanonicalFacts, fx: FindingFactory): CategoryAnal
     });
   }
 
-  if (demands.length === 0 && facts.textChars > 50) {
+  if (allDemands.length === 0 && facts.textChars > 50) {
     fx.add(positives, {
       category: 'payment',
       severity: 'positive',
@@ -930,9 +949,9 @@ function analyzeOfferLetter(facts: CanonicalFacts, fx: FindingFactory): Category
   }
 
   // Direction-aware: only a candidate→company payment inside the offer letter itself.
-  const offerDemands = paymentsOf(facts, 'candidate_pays').filter((p) => p.span.field === 'offerLetter');
+  const offerDemands = paymentsOf(facts, 'candidate_pays').filter((p) => p.span.field === 'offerLetter' && isStrongDemand(p));
   if (offerDemands.length > 0) {
-    const cues = Array.from(new Set(offerDemands.flatMap((d) => (d.purpose ? [d.purpose] : d.cues))));
+    const cues = Array.from(new Set(offerDemands.flatMap((d) => (d.cues.length > 0 ? d.cues : d.purpose ? [d.purpose] : []))));
     if (fx.add(findings, {
       category: 'offer',
       severity: 'critical',
@@ -990,55 +1009,23 @@ function analyzeSensitiveInfo(facts: CanonicalFacts, fx: FindingFactory): Catego
   // facts.ts with a 60-char window; negated mentions are excluded here.
   const govId = signalsOf(facts, 'sens_gov_id');
   const financial = signalsOf(facts, 'sens_financial');
+  const photo = signalsOf(facts, 'sens_photo');
   // Generic "ID proof" only counts when nothing more specific matched, so one
   // request is never counted under two labels.
   const genericId = govId.length === 0 ? signalsOf(facts, 'sens_gov_id_generic') : [];
-  // "Photo ID" names the identity document itself (reported under Government ID
-  // above), not a separate photograph - one request, one label. A genuinely
-  // separate photograph request ("ID and a passport-size photograph") is kept.
-  const photo = signalsOf(facts, 'sens_photo')
-    .filter((s) => !((govId.length > 0 || genericId.length > 0) && s.phrase.toLowerCase() === 'photo id'));
 
   if (govId.length > 0 || genericId.length > 0) {
     const hits = govId.length > 0 ? govId : genericId;
-
-    // Severity follows timing and context, never a document's name alone.
-    // Routine = EVERY mention is explicit post-selection onboarding AND the text
-    // has none of the suspicious signals already extracted by the facts layer
-    // (coercive pressure, messaging-app channel, candidate payment, financial
-    // details, offer without interview, unrealistic promises). Application-stage,
-    // unspecified timing, or any suspicious context keeps it critical.
-    const suspiciousContext =
-      signalsOf(facts, 'pressure').length > 0 ||
-      signalsOf(facts, 'messaging_platform').length > 0 ||
-      signalsOf(facts, 'sens_financial').length > 0 ||
-      signalsOf(facts, 'no_interview').length > 0 ||
-      signalsOf(facts, 'instant_selection').length > 0 ||
-      signalsOf(facts, 'scam_promise').length > 0 ||
-      paymentsOf(facts, 'candidate_pays').length > 0;
-    const routine = !suspiciousContext && hits.every((h) => h.idContext?.stage === 'post_selection');
-
-    // Say only what was actually requested - never "ID number" for a document.
-    const forms = new Set(hits.map((h) => h.idContext?.form ?? 'unspecified'));
-    const askedFor = forms.has('number') && forms.has('document') ? 'a government-issued identity document and an ID number'
-      : forms.has('number') ? 'a government-issued ID number'
-      : forms.has('document') ? 'a government-issued identity document'
-      : 'a government-issued identity credential (the posting does not say whether a number or a copy of the document is wanted)';
-
     if (fx.add(findings, {
       category: 'sensitive',
-      severity: routine ? 'caution' : 'critical',
+      severity: 'critical',
       title: 'Government ID requested',
-      finding: `The opportunity asks for ${askedFor}.`,
+      finding: 'The opportunity asks for a government-issued identity document or ID number.',
       evidence: quoted(phrasesOf(hits).slice(0, 3)),
-      explanation: routine
-        ? 'Collecting identity documents from selected candidates before they start is common practice, so on its own this is not a sign of fraud. These documents do enable identity theft if they reach the wrong party, so confirm the employer first and send them only through a channel you have verified.'
-        : 'Requests for a government ID (Aadhaar, PAN, passport, driving license, voter ID) before the employer is verified are a significant warning sign — these documents enable identity theft.',
-      action: routine
-        ? 'Confirm the employer is genuine, and that the request really comes from them, before sending any ID document or number.'
-        : 'Do not share government ID documents or numbers until the employer is independently verified.',
+      explanation: 'Requests for a government ID (Aadhaar, PAN, passport, driving license, voter ID) before the employer is verified are a significant warning sign — these documents enable identity theft.',
+      action: 'Do not share government ID documents or numbers until the employer is independently verified.',
       cites: hits,
-    })) scoreContribution += routine ? 8 : 20;
+    })) scoreContribution += 20;
   }
 
   if (financial.length > 0) {
@@ -1393,13 +1380,21 @@ export interface AnalyzeOptions {
   llmExtractor?: (text: string) => Promise<LlmExtractionResult>;
   /** Test seam: replaces the website / domain-age probes (which run inside extractFacts). */
   probes?: ExtractOptions['probes'];
+  /** Reads the posting for claims (claimReader.ts). Optional; failure falls back to rules. */
+  claimReader?: ExtractOptions['claimReader'];
+  /** Budget for the claim reader in ms (default 3500). */
+  claimsDeadlineMs?: number;
+  /** Wait limit for each external probe in ms (default 2500). */
+  probesDeadlineMs?: number;
+  /** Receives per-stage timings (llm / probes / claims / total) for logging. */
+  onTimings?: ExtractOptions['onTimings'];
   /** Called whenever the finding factory drops a finding for citing unsupported facts. */
   onIntegrityViolation?: (v: IntegrityViolation) => void;
 }
 
 export async function analyzeOpportunity(input: OpportunityInput, options: AnalyzeOptions = {}): Promise<AnalysisResult> {
   // The ONE read of the raw input. Everything below sees only verified facts.
-  const facts = await extractFacts(input, { llmApiKey: options.llmApiKey, llmExtractor: options.llmExtractor, probes: options.probes });
+  const facts = await extractFacts(input, { llmApiKey: options.llmApiKey, llmExtractor: options.llmExtractor, probes: options.probes, claimReader: options.claimReader, claimsDeadlineMs: options.claimsDeadlineMs, probesDeadlineMs: options.probesDeadlineMs, onTimings: options.onTimings });
   const fx = new FindingFactory(facts, options.onIntegrityViolation);
 
   const companyCategory = analyzeCompany(facts, fx);
@@ -1464,7 +1459,7 @@ export async function analyzeOpportunity(input: OpportunityInput, options: Analy
   }));
 
   return {
-    id: randomUUID(),
+    id: crypto.randomUUID(),
     riskScore: score,
     riskLevel,
     verificationConfidence,

@@ -35,8 +35,17 @@ if (!existsSync(ssrEntry)) {
 // pathToFileURL instead of a hand-built `file://${path}` string: on
 // Windows a raw path has backslashes and a drive letter, neither of which
 // is a valid file:// URL, so dynamic import() would fail there.
-const { render, PRERENDERED_ROUTES, pageMeta, buildJsonLd, SITE_URL, DEFAULT_TITLE, DEFAULT_DESCRIPTION } =
+const { render, PRERENDERED_ROUTES, pageMeta, buildJsonLd, SITE_URL, DEFAULT_TITLE, DEFAULT_DESCRIPTION, unfilledLegalFields } =
   await import(pathToFileURL(ssrEntry).href);
+
+// The Terms / Privacy / Refund / Contact pages state who runs the business and where to reach
+// them. Publishing them with placeholder text would be worse than not publishing them, so the
+// build stops until src/config/legal.ts is filled in. ALLOW_LEGAL_PLACEHOLDERS=1 overrides (testing only).
+const unfilled = unfilledLegalFields();
+if (unfilled.length > 0 && !process.env.ALLOW_LEGAL_PLACEHOLDERS) {
+  console.error(`\n✖ Build stopped: fill in src/config/legal.ts before publishing. Still placeholders: ${unfilled.join(', ')}.\n  (To build anyway while testing: set ALLOW_LEGAL_PLACEHOLDERS=1)\n`);
+  process.exit(1);
+}
 
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');

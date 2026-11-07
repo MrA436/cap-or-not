@@ -35,8 +35,17 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env, waitUnti
     );
   }
 
+  // Per-stage timing, logged once per request as "[analyze timing]" so a slow
+  // request can be attributed to the database, the analysis, or an outside call.
+  const t0 = Date.now();
+  const timing: Record<string, number> = {};
+  const lap = async <T,>(label: string, p: Promise<T>): Promise<T> => {
+    const s = Date.now();
+    try { return await p; } finally { timing[label] = Date.now() - s; }
+  };
+
   const client = openDbClient(env.HYPERDRIVE);
-  await client.connect();
+  await lap('dbConnectMs', client.connect());
 
   try {
     const input = (await request.json()) as Partial<OpportunityInput>;
@@ -77,9 +86,15 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env, waitUnti
     // This is what lets someone leave and come back later to the same
     // report/free-check allowance, on this browser, without an account.
     const { userId } = resolveUserId(request);
-    await ensureUser(client, userId);
+    await lap('ensureUserMs', ensureUser(client, userId));
 
-    const fullResult = await analyzeOpportunity(safeInput, { llmApiKey: env.LLM_API_KEY });
+    // The Workers AI binding is optional: without it (or if the model is slow, down or
+    // out of free quota) the rules-based reader answers alone.
+    const fullResult = await lap('analyzeMs', analyzeOpportunity(safeInput, {
+      llmApiKey: env.LLM_API_KEY,
+      claimReader: undefined,
+      onTimings: (t) => { timing.llmMs = t.llm; timing.probesMs = t.probes; timing.claimsMs = t.claims; },
+    }));
 
     // 5 free screenings, lifetime, per persistent user id (not per IP —
     // see _lib/store.ts). This only decides how rich the preview is —
@@ -88,17 +103,17 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env, waitUnti
     // used up. Neither tier ever includes the full report; that only
     // ever comes from /api/report or /api/unlock once reports.paid is
     // true for this specific report.
-    const freeCheck = await consumeFreeCheck(client, userId);
+    const freeCheck = await lap('freeCheckMs', consumeFreeCheck(client, userId));
     const tier: PreviewTier = freeCheck.withinFreeTrial ? 'standard' : 'limited';
     const publicResult = toPublicResult(fullResult, tier);
 
-    await saveReport(client, {
+    await lap('saveReportMs', saveReport(client, {
       id: publicResult.id,
       userId,
       input: safeInput,
       fullResult,
       previewTier: tier,
-    });
+    }));
 
     const response: AnalyzeResponse = {
       publicResult,
@@ -112,6 +127,7 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env, waitUnti
     console.error('analyze error', err);
     return json({ error: 'Analysis failed' }, 500);
   } finally {
+    console.log('[analyze timing]', JSON.stringify({ ...timing, totalMs: Date.now() - t0 }));
     // Close the connection in the background rather than making the
     // response wait for it — Hyperdrive's own pool is what actually
     // stays warm between requests, this is just this one request's

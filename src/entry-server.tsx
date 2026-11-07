@@ -7,6 +7,8 @@ import App from './App.tsx';
 // JSON-LD source of truth the client uses (@/seo/meta) out of this one SSR
 // bundle, instead of building and importing a second bundle just for that.
 export { SITE_URL, pageMeta, buildJsonLd, DEFAULT_TITLE, DEFAULT_DESCRIPTION, PRERENDERED_ROUTES } from '@/seo/meta';
+// Lets scripts/prerender.mjs refuse to publish legal pages that still hold placeholders.
+export { unfilledLegalFields } from '@/config/legal';
 
 // Build-time only: scripts/prerender.mjs imports this (via a `vite build
 // --ssr` bundle) and calls render(path) once per route in

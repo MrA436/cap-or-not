@@ -30,7 +30,12 @@
  *  6. External probes (website reachability, domain age) run HERE and enter as
  *     verified `observation` facts with a typed outcome. analyzer.ts performs
  *     no I/O. A failed probe is only evidence if the probe could observe at all.
- *  7. The LLM is an extractor of CANDIDATES only. A candidate becomes a fact
+ *  7. A model may READ the posting (claimReader.ts) but only proposes claims: each
+ *     needs a verbatim quote found in the text and any amount found inside that
+ *     quote, or it is dropped. The model can add what the rules missed and can
+ *     veto a rules hit it explicitly calls negated/warning/not-a-demand; its
+ *     silence changes nothing, and any failure leaves the rules-only result.
+ *  8. The LLM is an extractor of CANDIDATES only. A candidate becomes a fact
  *     only if its quote is located in the real text and contains its value.
  *     Any failure → UNKNOWN.
  */
@@ -38,16 +43,13 @@
 import type { OpportunityInput } from '../types/analysis.js';
 import { findRecruiterName, findCompanyLabelled, findCompanyProse, type Hit } from './extract.js';
 import { extractWithLlm, UNKNOWN_LLM_RESULT, type LlmExtractionResult } from './llmExtract.js';
+import type { ClaimReader, RawClaim, SensitiveItem } from './claimReader.js';
 import { lookupDomainAge, type DomainAgeResult } from './rdap.js';
 import { checkWebsiteReachable, type WebsiteReachabilityResult } from './websiteCheck.js';
 import {
-  negatedBefore, polarityOf, allZero, companyBearsCost, classifyIdRequest, type IdContext,
-  URGENCY_TERMS, URGENCY_PATTERN, SELF_CONTAINED_COERCION, CONSEQUENCE_CUES, CONSEQUENCE_LEAD,
-  EXPIRY_CUES, COMPRESSED_URGENCY,
+  negatedBefore, polarityOf, allZero, MASKED_ABBREV,
+  URGENCY_TERMS, URGENCY_PATTERN, SELF_CONTAINED_COERCION, CONSEQUENCE_CUES, CONSEQUENCE_AFTER_OR, CONSEQUENCE_LEAD,
 } from './claims.js';
-
-// Non-global copy so .test() is stateless (URGENCY_PATTERN carries the g flag for matchAll).
-const COMPRESSED_TIME_PATTERN = new RegExp(URGENCY_PATTERN.source, 'i');
 
 // ───────────────────────────── types ─────────────────────────────
 
@@ -92,8 +94,20 @@ export interface BrandFact extends BaseFact {
  *  - unknown:            an amount with no direction evidence. Never scored.
  */
 export type PaymentDirection = 'candidate_pays' | 'candidate_receives' | 'unknown';
+/**
+ * How much the evidence for a candidate_pays fact can be trusted:
+ *  confirmed         rules and the model both read it as a demand.
+ *  llm_only          the model read it; no rule matched (the unseen-phrasing case).
+ *  rules_unchecked   rules only, no model was available to check.
+ *  rules_unconfirmed rules only; the model ran and said nothing about it (silence is not a veto).
+ *  contested         the model says "asserted" but the rules positively see a negation
+ *                    or a warning inside the model's own quote. Reported as a caution only.
+ */
+export type PaymentStatus = 'confirmed' | 'llm_only' | 'rules_unchecked' | 'rules_unconfirmed' | 'contested';
+
 export interface PaymentFact extends BaseFact {
   kind: 'payment';
+  status?: PaymentStatus;
   direction: PaymentDirection;
   /** Human-facing purpose for a candidate_pays fact, e.g. "training fee". */
   purpose: string | null;
@@ -120,8 +134,6 @@ export interface SignalFact extends BaseFact {
   phrase: string;
   /** True when a negation word precedes the mention ("we never ask for your Aadhaar"). */
   negated: boolean;
-  /** Government-ID mentions only: when in the process it is asked for, and whether a number or a document. */
-  idContext?: IdContext;
 }
 
 /** One per non-empty free-text field; lets "nothing found" findings cite something real. */
@@ -159,12 +171,16 @@ export interface CanonicalFacts {
   documents: Verified<DocumentFact>[];
   observations: Verified<ObservationFact>[];
   /** Hits that matched a lexicon but did NOT become claims (negated, warning, zero, neutral urgency). */
-  suppressed: { kind: 'payment' | 'pressure'; reason: string; quote: string }[];
+  suppressed: { kind: 'payment' | 'pressure' | 'sensitive'; reason: string; quote: string }[];
+  /** What the model reader did: off (none configured), ok, or unavailable (timeout/quota/bad output). */
+  claims: { status: 'off' | 'ok' | 'unavailable'; total: number; accepted: number; rejected: number };
   /** Words / characters across description + recruiterMessage + offerLetter. */
   wordCount: number;
   textChars: number;
   /** True only if the LLM call completed (regardless of whether anything verified). */
   llmUsed: boolean;
+  /** Wall-clock cost of each I/O stage. llm and probes OVERLAP, so total < llm + probes. */
+  timingsMs: { llm: number; probes: number; claims: number; total: number };
   /** Facts that failed verification and were dropped — for tests/diagnostics only. */
   dropped: { kind: string; reason: string }[];
   /** Every verified fact by id — the integrity guard checks citations against this. */
@@ -211,6 +227,22 @@ const PAY_VERB_CUES = ['pay ₹', 'pay rs', 'pay $'];
 // though it contains neither a fee noun nor "pay". A purchase counts only with
 // (a) an amount after the verb, (b) a program/product noun in the same clause
 // ("lunch at the canteen" is not a demand), and (c) a candidate subject.
+// STRUCTURE, not vocabulary. A scammer can always invent a new fee noun
+// ("caution money"); what does not vary is an AMOUNT plus an obligation word,
+// a payment method, or the head noun of a fee-like phrase. These closed classes
+// catch the unseen noun. All of them are skipped when the clause is about
+// money paid TO the candidate, and all pass the same polarity gate.
+const HEAD_NOUN_PHRASE = /(?:[A-Za-z-]+\s+){0,2}(?:fees?|charges?|deposits?|dues|contributions?|money)(?![A-Za-z])/gi;
+const OBLIGATION_PREDICATES = [
+  'payable', 'to be paid', 'has to be paid', 'have to be paid', 'must be paid', 'will be charged', 'is charged',
+  'be charged', 'levied', 'non-refundable', 'non refundable', 'compulsory', 'mandatory', 'upfront', 'up-front', 'in advance',
+  'confirm your seat', 'confirm your slot', 'secure your seat', 'secure your slot', 'reserve your seat', 'block your seat',
+  'be submitted', 'be remitted', 'payment of', 'make a payment', 'make payment', 'costs',
+  // Hinglish obligation forms (closed set)
+  'dena hoga', 'dena padega', 'deni hogi', 'dene honge', 'bharna hoga', 'bharna padega', 'jama karna', 'jama karein', 'bhejna hoga',
+];
+const PAYMENT_METHODS = ['upi', 'qr code', 'neft', 'imps', 'rtgs', 'netbanking', 'net banking'];
+const MONEY_MOVING_VERBS = ['pay', 'deposit', 'remit', 'transfer', 'send', 'bear', 'contribute', 'submit'];
 const PURCHASE_VERBS = ['purchase', 'buy', 'enroll in', 'enrol in', 'subscribe to', 'invest'];
 const PURCHASE_OBJECT = /\b(?:package|kit|course|program(?:me)?|bundle|licen[sc]e|membership|subscription|certification|training|laptop|software|plan)\b/i;
 const PURCHASE_PURPOSE = /^\s+((?:[A-Za-z-]+\s+){0,6}?(?:package|kit|course|program(?:me)?|bundle|fee|charges?|deposit|licen[sc]e|plan|subscription|membership))\b/i;
@@ -227,6 +259,8 @@ const STRONG_COMP_CUES = [
   'you will receive', 'you will earn', 'you will get', 'we pay', 'we will pay', 'earned by',
   'monthly pay', 'take-home', 'base pay', 'pay range', 'above market', 'market average',
   'earn up to', 'ctc', 'remuneration', 'credited', 'incentive', 'bonus',
+  'reward', 'referral', 'reimbursement', 'reimbursed', 'allowance', 'commission', 'cashback',
+  'honorarium', 'prize', 'earn', 'earning', 'earnings', 'income', 'wage', 'wages', 'fellowship', 'scholarship',
 ];
 const RATE_CUES = ['per month', '/month', 'per week', '/week', 'per hour', '/hour', 'per day'];
 // Exported for the quality-notes signal (same list the old analyzer used).
@@ -351,11 +385,11 @@ const SIGNAL_DEFS: SignalDef[] = [
 
 // ───────────────────────────── money ─────────────────────────────
 
-const CUR = '(?:₹|\\$|€|£|Rs\\.?|INR)';
+const CUR = '(?:₹|\\$|€|£|(?<![A-Za-z])(?:Rs\\.?|INR))';
 const NUM = '\\d+(?:,\\d{2,3})*(?:\\.\\d+)?';
 const SUF = '(?:\\s?(?:k|K|lakh|lakhs|crore|crores))?';
 const PERIOD = '(?:\\s?\\/\\s?(?:month|mo|week|wk|hour|hr|day))?';
-const MONEY_PREFIXED = new RegExp(`${CUR}\\s?${NUM}${SUF}(?:\\s?(?:-|–|—|to)\\s?(?:${CUR}\\s?)?${NUM}${SUF})?${PERIOD}`, 'g');
+const MONEY_PREFIXED = new RegExp(`${CUR}\\s?${NUM}${SUF}(?:\\s?(?:-|–|—|to)\\s?(?:${CUR}\\s?)?${NUM}${SUF})?${PERIOD}`, 'gi');
 const MONEY_SUFFIXED = new RegExp(`(?<![A-Za-z0-9₹$€£.,])${NUM}\\s?(?:INR|rupees?|Rs\\.?)(?![A-Za-z])${PERIOD}`, 'gi');
 
 function findAmounts(s: string): { text: string; idx: number }[] {
@@ -374,7 +408,6 @@ function findAmounts(s: string): { text: string; idx: number }[] {
 
 // ───────────────────────────── clause splitting ─────────────────────────────
 
-const MASKED_ABBREV = /\b(?:Rs|Pvt|Ltd|Mr|Mrs|Ms|Dr|Jr|Sr|No|approx|etc)\.|\b(?:e\.g|i\.e)\./gi;
 
 /**
  * Splits a field into clauses: one per line, then by sentence end, ';', ' | '
@@ -452,11 +485,6 @@ function analyseClause(c: string, lineTail = ''): ClauseAnalysis {
   };
 
   for (const m of findMentions(c, FEE_TERMS)) {
-    // A fee the COMPANY pays ("the company bears the certification fee") is not a demand on the candidate.
-    if (companyBearsCost(c, m.start, m.end)) {
-      suppressed.push({ cue: c.slice(m.start, m.end), reason: 'company_bears' });
-      continue;
-    }
     admit(m.start, m.end, c.slice(m.start, m.end), m.phrase);
   }
   for (const m of findMentions(c, PAY_VERB_CUES)) {
@@ -484,6 +512,35 @@ function analyseClause(c: string, lineTail = ''): ClauseAnalysis {
       for (const m of findMentions(c, CRYPTO_TERMS)) {
         admit(m.start, m.end, c.slice(m.start, m.end), 'crypto payment');
       }
+    }
+  }
+
+  // Generalising families: only for clauses that are not about money TO the candidate.
+  if (strongComp.length === 0 && weakComp.length === 0 && amounts.length > 0) {
+    const near = (start: number, end: number, reach: number) =>
+      amounts.some((a) => (a.idx >= end && a.idx - end <= reach) || (a.idx + a.text.length <= start && start - (a.idx + a.text.length) <= reach));
+    // (H) head noun of a fee-like phrase next to an amount: "caution money: ₹999", "₹500 joining fee".
+    HEAD_NOUN_PHRASE.lastIndex = 0;
+    for (const m of Array.from(c.matchAll(HEAD_NOUN_PHRASE))) {
+      const start = m.index!, end = start + m[0].length;
+      const modifiers = m[0].trim().split(/\s+/).slice(0, -1).join(' ');
+      if (/\b(?:will|would|shall|can|could|may|might|must|to|we|you|they|please|kindly|do|does|did)\b/i.test(modifiers)) continue; // verb use, not a noun
+      // Gate at the HEAD noun: a negator inside the captured modifiers ("no joining fee")
+      // must be seen as "before the cue", not swallowed into the cue itself.
+      const headLen = (m[0].match(/[A-Za-z]+$/) ?? [''])[0].length;
+      if (near(start, end, 30)) admit(end - headLen, end, m[0].trim(), m[0].trim().toLowerCase());
+    }
+    // (P) an obligation word, or a payment method, in a clause that carries an amount.
+    for (const m of findMentions(c, OBLIGATION_PREDICATES)) admit(m.start, m.end, c.slice(m.start, m.end), 'payment request');
+    for (const m of findMentions(c, PAYMENT_METHODS)) admit(m.start, m.end, c.slice(m.start, m.end), 'payment request');
+    // (V) a money-moving verb with an amount after it; direction from its subject.
+    for (const m of findMentions(c, MONEY_MOVING_VERBS)) {
+      if (/^\s*[:=\-–—]/.test(c.slice(m.end))) continue; // "Pay: ₹15,000" is a label, not a verb
+      const amt = amounts.find((a) => a.idx >= m.end && a.idx - m.end <= 40);
+      if (!amt) continue;
+      const dir = payVerbDirection(c, m.start);
+      if (dir === 'candidate_pays') admit(m.start, m.end, c.slice(m.start, m.end), 'payment request');
+      else if (dir === 'candidate_receives') recvCues.push({ phrase: c.slice(m.start, m.end), idx: m.start });
     }
   }
 
@@ -568,6 +625,18 @@ function mint<T extends Fact>(f: T): Verified<T> {
 // ───────────────────────────── extraction ─────────────────────────────
 
 export interface ExtractOptions {
+  /** Reads the posting and returns claims (claimReader.ts). Null result = unavailable. */
+  claimReader?: ClaimReader;
+  /** Hard budget for the model reader; on expiry the rules-only result is used. Default 3500ms. */
+  claimsDeadlineMs?: number;
+  /**
+   * Hard wait limit for EACH external probe (website, domain age). On expiry that probe is
+   * "inconclusive" (a verification gap), so one slow lookup can never stall the whole report.
+   * Default 2500ms.
+   */
+  probesDeadlineMs?: number;
+  /** Called once with the per-stage wall-clock costs, for logging. */
+  onTimings?: (t: CanonicalFacts['timingsMs']) => void;
   /** Test seam / override for the external probes. Defaults to the real network probes. */
   probes?: {
     website?: (url: string) => Promise<WebsiteReachabilityResult>;
@@ -597,6 +666,58 @@ function hitSpan(hit: Hit, field: SourceField, text: string): Span {
   return { field, start: hit.start, end: hit.end, quote: text.slice(hit.start, hit.end) };
 }
 
+function withDeadline<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const guarded = p.catch(() => null);
+  return Promise.race([guarded, new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), ms); })])
+    .finally(() => { if (timer) clearTimeout(timer); });
+}
+
+const numbersIn = (s: string): number[] => (s.match(/\d[\d,]*(?:\.\d+)?/g) ?? []).map((n) => parseFloat(n.replace(/,/g, '')));
+
+/** Cut at a word boundary so the phrase is still a verbatim, boundary-safe slice of its quote. */
+function shortPhrase(q: string, max = 80): string {
+  if (q.length <= max) return q;
+  const cut = q.lastIndexOf(' ', max);
+  return q.slice(0, cut > 20 ? cut : max);
+}
+
+interface VerifiedClaim extends RawClaim { span: Span; amounts: string[] }
+
+/**
+ * A claim becomes usable only if its quote is found in the real text and, for a
+ * payment, every number in its amount appears inside that quote. Amounts that
+ * reach a fact are taken from the QUOTE (verbatim), never from the model.
+ */
+function verifyClaims(raw: RawClaim[], sources: Sources): { ok: VerifiedClaim[]; rejected: number } {
+  const ok: VerifiedClaim[] = [];
+  let rejected = 0;
+  for (const c of raw) {
+    const span = locateQuote(c.quote, sources);
+    if (!span) { rejected++; continue; }
+    let amounts: string[] = [];
+    if (c.type === 'payment') {
+      const inQuote = findAmounts(span.quote).map((a) => a.text);
+      const want = c.amount ? numbersIn(c.amount) : [];
+      if (want.length > 0) {
+        const have = numbersIn(span.quote);
+        if (!want.every((n) => have.includes(n))) { rejected++; continue; }
+        amounts = inQuote.filter((a) => numbersIn(a).some((n) => want.includes(n)));
+      } else {
+        amounts = inQuote;
+      }
+    }
+    ok.push({ ...c, span, amounts });
+  }
+  return { ok, rejected };
+}
+
+const spansOverlap = (a: Span, b: Span) => a.field === b.field && a.start < b.end && b.start < a.end;
+
+const SENSITIVE_SIGNAL: Partial<Record<SensitiveItem, SignalKind>> = {
+  government_id: 'sens_gov_id', bank_details: 'sens_financial', otp_or_password: 'sens_financial', photo: 'sens_photo',
+};
+
 export async function extractFacts(input: OpportunityInput, options: ExtractOptions = {}): Promise<CanonicalFacts> {
   const sources: Sources = {
     company: input.company, recruiterName: input.recruiterName, recruiterEmail: input.recruiterEmail,
@@ -604,6 +725,7 @@ export async function extractFacts(input: OpportunityInput, options: ExtractOpti
     description: input.description, recruiterMessage: input.recruiterMessage, offerLetter: input.offerLetter,
   };
 
+  const t0 = Date.now();
   let n = 0;
   const nextId = () => `fact-${++n}`;
   const candidates: Fact[] = [];
@@ -624,6 +746,44 @@ export async function extractFacts(input: OpportunityInput, options: ExtractOpti
   const website = typed('companyWebsite', 'website');
   const jobTitle = typed('jobTitle', 'job_title');
   const jobUrl = typed('jobPostingUrl', 'job_url');
+
+  // 1b. Start the external probes NOW, so they run while the LLM (step 3) is
+  //     waiting. They depend only on the typed website, not on anything the
+  //     LLM returns; awaiting them at 7c makes the waits overlap instead of add.
+  let probesMs = 0;
+  const probesPromise: Promise<[WebsiteReachabilityResult, DomainAgeResult]> | null = website
+    ? (async () => {
+        const started = Date.now();
+        const domain = domainOf(website.value);
+        const runSite = options.probes?.website ?? checkWebsiteReachable;
+        const runAge = options.probes?.domainAge ?? lookupDomainAge;
+        const unableSite: WebsiteReachabilityResult = { status: 'unable_to_verify' };
+        const unableAge: DomainAgeResult = { status: 'unable_to_verify', ageDays: null, registeredDate: null };
+        const limit = options.probesDeadlineMs ?? 2500;
+        // withDeadline also swallows errors: any failure or timeout is simply "unable to verify".
+        const out = await Promise.all([
+          withDeadline(runSite(website.value), limit).then((r) => r ?? unableSite),
+          domain ? withDeadline(runAge(domain), limit).then((r) => r ?? unableAge) : Promise.resolve(unableAge),
+        ]);
+        probesMs = Date.now() - started;
+        return out;
+      })()
+    : null;
+
+  // 1c. Start the model reader NOW too: it overlaps the probes and the rules, so
+  //     its wait is hidden behind them. Any failure resolves to null (rules-only).
+  let claimsMs = 0;
+  const claimsText = TEXT_FIELDS.map((f) => sources[f]).join('\n');
+  const claimsPromise: Promise<RawClaim[] | null> | null = options.claimReader && claimsText.trim()
+    ? (async () => {
+        const started = Date.now();
+        try {
+          return await withDeadline(options.claimReader!(claimsText), options.claimsDeadlineMs ?? 3500);
+        } finally {
+          claimsMs = Date.now() - started;
+        }
+      })()
+    : null;
 
   // 2. Labelled / prose extraction from the pasted text, per field (so spans are exact).
   const fromText = <R,>(find: (t: string) => Hit | null, build: (hit: Hit, field: SourceField) => R): R | null => {
@@ -650,7 +810,9 @@ export async function extractFacts(input: OpportunityInput, options: ExtractOpti
   // 3. LLM — a CANDIDATE source, consulted only for what is still missing. Any
   //    failure, or a candidate whose quote can't be located, leaves it UNKNOWN.
   let llmUsed = false;
+  let llmMs = 0;
   if ((!company || !recruiterName) && (options.llmExtractor || options.llmApiKey)) {
+    const llmStarted = Date.now();
     const combined = TEXT_FIELDS.map((f) => sources[f]).join('\n');
     let llm: LlmExtractionResult = UNKNOWN_LLM_RESULT;
     try {
@@ -661,6 +823,7 @@ export async function extractFacts(input: OpportunityInput, options: ExtractOpti
       llm = UNKNOWN_LLM_RESULT;
     }
     llmUsed = llm.usedLlm;
+    llmMs = Date.now() - llmStarted;
     if (!company && llm.company && llm.companyQuote) {
       const span = locateQuote(llm.companyQuote, sources);
       if (span) company = add({ id: nextId(), kind: 'company', origin: 'llm', value: llm.company, span });
@@ -718,8 +881,6 @@ export async function extractFacts(input: OpportunityInput, options: ExtractOpti
         let phrase = m.phrase;
         if (def.kind === 'messaging_platform' && /signal/.test(phrase)) phrase = 'signal';
         add({ id: nextId(), kind: 'signal', origin: 'derived', signal: def.kind, phrase, negated: m.negated,
-            ...(def.kind === 'sens_gov_id' || def.kind === 'sens_gov_id_generic'
-            ? { idContext: classifyIdRequest(text, m.start, m.end, phrase) } : {}),
           span: { field, start: m.start, end: m.end, quote: text.slice(m.start, m.end) } });
       }
       for (const re of def.patterns ?? []) {
@@ -731,6 +892,67 @@ export async function extractFacts(input: OpportunityInput, options: ExtractOpti
         }
       }
     }
+  }
+
+  // 6b. Merge the model's reading. Rules produced candidates above; the model may
+  //     (1) ADD a demand / sensitive request the rules had no cue for, and
+  //     (2) VETO a rules hit by explicitly calling it negated / a warning / pay TO
+  //         the candidate. Silence from the model never removes anything.
+  let claimsStatus: CanonicalFacts['claims']['status'] = 'off';
+  let claimsTotal = 0;
+  let verifiedClaims: VerifiedClaim[] = [];
+  if (claimsPromise) {
+    const raw = await claimsPromise;
+    if (raw === null) {
+      claimsStatus = 'unavailable';
+    } else {
+      claimsStatus = 'ok';
+      claimsTotal = raw.length;
+      verifiedClaims = verifyClaims(raw, sources).ok;
+    }
+  }
+  const dropCandidate = (f: Fact) => { const i = candidates.indexOf(f); if (i >= 0) candidates.splice(i, 1); };
+  const ruleDemands = () => candidates.filter((f): f is PaymentFact => f.kind === 'payment' && f.direction === 'candidate_pays');
+  const readSpans: Span[] = [];
+  for (const c of verifiedClaims.filter((x) => x.type === 'payment')) {
+    const hits = ruleDemands().filter((p) => spansOverlap(p.span, c.span));
+    if (c.stance !== 'asserted' || c.direction !== 'candidate_pays') {
+      for (const p of hits) {
+        dropCandidate(p);
+        suppressedList.push({ kind: 'payment', reason: c.stance === 'asserted' ? 'model: money paid to the candidate' : `model: ${c.stance}`, quote: p.span.quote });
+      }
+      if (c.stance === 'asserted' && c.direction === 'candidate_receives' && c.amounts.length > 0) {
+        add({ id: nextId(), kind: 'payment', origin: 'llm', span: c.span, direction: 'candidate_receives', purpose: null, cues: [], amounts: c.amounts });
+      }
+      continue;
+    }
+    if (readSpans.some((sp) => spansOverlap(sp, c.span))) continue; // same sentence read twice
+    readSpans.push(c.span);
+    // The rules read the model's OWN quote only as a veto: if they positively see a
+    // negation or warning inside it, the model's "asserted" is contested.
+    const read = analyseClause(c.span.quote);
+    const contested = !read.pay && read.suppressed.some((x) => x.reason === 'negated' || x.reason === 'warning');
+    for (const p of hits) dropCandidate(p);
+    add({
+      id: nextId(), kind: 'payment', origin: 'llm', span: c.span, direction: 'candidate_pays',
+      // Model free text never reaches a finding: the purpose is a constant and the cue is the verified quote.
+      purpose: 'payment request', cues: [shortPhrase(c.span.quote)], amounts: c.amounts,
+      status: contested ? 'contested' : hits.length > 0 ? 'confirmed' : 'llm_only',
+    });
+  }
+  for (const p of ruleDemands()) {
+    if (p.status === undefined) p.status = claimsStatus === 'ok' ? 'rules_unconfirmed' : 'rules_unchecked';
+  }
+  for (const c of verifiedClaims.filter((x) => x.type === 'sensitive_request')) {
+    const kind = c.item ? SENSITIVE_SIGNAL[c.item] : undefined;
+    if (!kind) continue;
+    const hits = candidates.filter((f): f is SignalFact => f.kind === 'signal' && f.signal.startsWith('sens_') && spansOverlap(f.span, c.span));
+    if (c.stance !== 'asserted') {
+      for (const h of hits) { dropCandidate(h); suppressedList.push({ kind: 'sensitive', reason: `model: ${c.stance}`, quote: h.span.quote }); }
+      continue;
+    }
+    if (hits.length > 0) continue; // rules already saw this spot (reported, or negated = their veto)
+    add({ id: nextId(), kind: 'signal', origin: 'llm', signal: kind, negated: false, phrase: shortPhrase(c.span.quote).toLowerCase(), span: c.span });
   }
 
   // 7b. Pressure = a time constraint COUPLED to coercion. A deadline, "urgent
@@ -751,18 +973,12 @@ export async function extractFacts(input: OpportunityInput, options: ExtractOpti
         ...findMentions(clause, URGENCY_TERMS).map((m) => ({ s: m.start, e: m.end })),
         ...Array.from(clause.matchAll(URGENCY_PATTERN)).map((m) => ({ s: m.index!, e: m.index! + m[0].length })),
       ];
-      // Expiry wording ("offer will expire") is a time limit; it is coercive only when the
-      // same clause also has a COMPRESSED time constraint ("within 2 hours", "immediately").
-      const compressed = COMPRESSED_TIME_PATTERN.test(clause) || findMentions(clause, COMPRESSED_URGENCY).length > 0;
-      const expiry = compressed ? findMentions(clause, EXPIRY_CUES).map((m) => ({ s: m.start, e: m.end })) : [];
-      const selfContained = [
-        ...findMentions(clause, SELF_CONTAINED_COERCION).map((m) => ({ s: m.start, e: m.end })),
-        ...expiry,
-      ];
+      const selfContained = findMentions(clause, SELF_CONTAINED_COERCION).map((m) => ({ s: m.start, e: m.end }));
       if (urgency.length === 0 && selfContained.length === 0) continue;
 
       const nextText = i + 1 < clauses.length ? text.slice(clauses[i + 1].start, clauses[i + 1].end) : '';
       const coupled = findMentions(clause, CONSEQUENCE_CUES).length > 0
+        || CONSEQUENCE_AFTER_OR.test(clause)
         || CONSEQUENCE_LEAD.test(nextText)
         || demandFacts.some((p) => overlaps(p.span, field, start, end))
         || sensitiveFacts.some((g) => overlaps(g.span, field, start, end));
@@ -779,20 +995,22 @@ export async function extractFacts(input: OpportunityInput, options: ExtractOpti
     }
   }
 
+  for (const c of verifiedClaims.filter((x) => x.type === 'pressure')) {
+    const hits = candidates.filter((f): f is SignalFact => f.kind === 'signal' && f.signal === 'pressure' && spansOverlap(f.span, c.span));
+    if (c.stance !== 'asserted') {
+      for (const h of hits) { dropCandidate(h); suppressedList.push({ kind: 'pressure', reason: `model: ${c.stance} (not coercive)`, quote: h.span.quote }); }
+      continue;
+    }
+    if (hits.length > 0) continue;
+    add({ id: nextId(), kind: 'signal', origin: 'llm', signal: 'pressure', negated: false, phrase: shortPhrase(c.span.quote).toLowerCase(), span: c.span });
+  }
+
   // 7c. External observations. Probes run HERE so that analyzer.ts is a pure
   //     function of verified facts. Each result is typed; a failure that could
   //     not have been observed (timeout, TLS, blocked, observer offline) is
   //     'inconclusive', never evidence about the site.
-  if (website) {
-    const domain = domainOf(website.value);
-    const runSite = options.probes?.website ?? checkWebsiteReachable;
-    const runAge = options.probes?.domainAge ?? lookupDomainAge;
-    const unableSite: WebsiteReachabilityResult = { status: 'unable_to_verify' };
-    const unableAge: DomainAgeResult = { status: 'unable_to_verify', ageDays: null, registeredDate: null };
-    const [site, age] = await Promise.all([
-      runSite(website.value).catch(() => unableSite),
-      domain ? runAge(domain).catch(() => unableAge) : Promise.resolve(unableAge),
-    ]);
+  if (website && probesPromise) {
+    const [site, age] = await probesPromise;
     add({ id: nextId(), kind: 'observation', origin: 'derived', span: website.span, probe: 'website_reachability',
       outcome: site.status === 'reachable' ? 'reachable' : site.status === 'unreachable' ? 'dns_not_found' : 'inconclusive',
       httpStatus: site.httpStatus });
@@ -840,6 +1058,8 @@ export async function extractFacts(input: OpportunityInput, options: ExtractOpti
   const identity = (f: IdentityFact | null) => (f && byId.has(f.id) ? (byId.get(f.id) as Verified<IdentityFact>) : null);
 
   const text = TEXT_FIELDS.map((f) => sources[f]).join(' ').trim();
+  const timingsMs = { llm: llmMs, probes: probesMs, claims: claimsMs, total: Date.now() - t0 };
+  options.onTimings?.(timingsMs);
   return {
     company: identity(company),
     recruiterName: identity(recruiterName),
@@ -856,6 +1076,8 @@ export async function extractFacts(input: OpportunityInput, options: ExtractOpti
     wordCount: text ? text.split(/\s+/).length : 0,
     textChars: text.length,
     llmUsed,
+    timingsMs,
+    claims: { status: claimsStatus, total: claimsTotal, accepted: verifiedClaims.length, rejected: claimsTotal - verifiedClaims.length },
     dropped,
     byId,
   };
@@ -937,4 +1159,9 @@ export function phrasesOf(signals: SignalFact[]): string[] {
 
 export function paymentsOf(facts: CanonicalFacts, direction: PaymentDirection): Verified<PaymentFact>[] {
   return facts.payments.filter((p) => p.direction === direction);
+}
+
+/** A demand is "strong" unless the model and the rules disagree about whether it was asserted. */
+export function isStrongDemand(p: PaymentFact): boolean {
+  return p.status !== 'contested';
 }

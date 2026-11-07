@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Lock, ShieldCheck, Loader2 } from 'lucide-react';
 import type { AnalysisResult } from '@/types/analysis';
+import { LEGAL } from '@/config/legal';
 
 interface UnlockGateProps {
   reportId: string;
@@ -148,7 +149,12 @@ export default function UnlockGate({ reportId, onUnlocked }: UnlockGateProps) {
         )}
       </button>
       {errorMsg && <p className="mt-3 text-xs text-red-600">{errorMsg}</p>}
-      <p className="mt-3 text-xs text-gray-400">Secure payment via Razorpay</p>
+      <p className="mt-3 text-xs text-gray-400">One-time {LEGAL.reportPrice} per report. Secure payment via Razorpay.</p>
+      <p className="mt-1 text-xs text-gray-400">
+        By paying you agree to the{' '}
+        <a href="/terms" target="_blank" rel="noopener" className="underline hover:text-gray-600">Terms</a> and{' '}
+        <a href="/refund-policy" target="_blank" rel="noopener" className="underline hover:text-gray-600">Refund Policy</a>.
+      </p>
 
       {!showCodeInput ? (
         <button

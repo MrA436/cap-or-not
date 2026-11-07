@@ -6,6 +6,7 @@ import {
   jobScamChecker,
 } from '@/pages/seoContent';
 import type { SEOContent } from '@/pages/SEOPage';
+import { termsContent, privacyContent, refundContent, contactContent } from '@/pages/legalContent';
 
 export const SITE_URL = 'https://capornot.com';
 
@@ -21,6 +22,10 @@ export const PRERENDERED_ROUTES = [
   '/is-this-recruiter-legit',
   '/fake-internship-signs',
   '/job-scam-checker',
+  '/terms',
+  '/privacy',
+  '/refund-policy',
+  '/contact',
 ] as const;
 
 // SEOContent (from seoContent.ts) doubles as the source for each guide's
@@ -43,6 +48,10 @@ export const pageMeta: Record<string, { title: string; description: string; arti
   '/is-this-internship-legit': { title: isThisInternshipLegit.title, description: isThisInternshipLegit.metaDescription, article: isThisInternshipLegit },
   '/is-this-recruiter-legit': { title: isThisRecruiterLegit.title, description: isThisRecruiterLegit.metaDescription, article: isThisRecruiterLegit },
   '/fake-internship-signs': { title: fakeInternshipSigns.title, description: fakeInternshipSigns.metaDescription, article: fakeInternshipSigns },
+  '/terms': { title: termsContent.title, description: termsContent.metaDescription },
+  '/privacy': { title: privacyContent.title, description: privacyContent.metaDescription },
+  '/refund-policy': { title: refundContent.title, description: refundContent.metaDescription },
+  '/contact': { title: contactContent.title, description: contactContent.metaDescription },
   '/job-scam-checker': { title: jobScamChecker.title, description: jobScamChecker.metaDescription, article: jobScamChecker },
 };
 

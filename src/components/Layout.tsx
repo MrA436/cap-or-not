@@ -94,6 +94,12 @@ export default function Layout({ children }: { children: React.ReactNode }) {
               <Link to="/job-scam-checker" className="hover:text-gray-900 transition-colors">Job Scam Checker</Link>
             </nav>
           </div>
+          <nav className="mt-5 flex flex-wrap items-center justify-center gap-x-5 gap-y-2 text-sm text-gray-500">
+            <Link to="/terms" className="hover:text-gray-900 transition-colors">Terms</Link>
+            <Link to="/privacy" className="hover:text-gray-900 transition-colors">Privacy</Link>
+            <Link to="/refund-policy" className="hover:text-gray-900 transition-colors">Refunds</Link>
+            <Link to="/contact" className="hover:text-gray-900 transition-colors">Contact</Link>
+          </nav>
           <p className="mt-6 text-xs text-gray-400 text-center max-w-2xl mx-auto">
             Cap or Not calls out red flags, it doesn't hand out verdicts. It does not guarantee that an opportunity is legitimate or fraudulent. Always verify through official channels.
           </p>
