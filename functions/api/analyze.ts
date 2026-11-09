@@ -44,8 +44,10 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env, waitUnti
     try { return await p; } finally { timing[label] = Date.now() - s; }
   };
 
+  // Not connected yet: connect() runs below, inside the try, in parallel with the analysis.
+  // (It used to run before the try, so a database that was down or unreachable threw an
+  // uncaught error and the browser got a non-JSON 500 it could only show as "Analysis failed".)
   const client = openDbClient(env.HYPERDRIVE);
-  await lap('dbConnectMs', client.connect());
 
   try {
     const input = (await request.json()) as Partial<OpportunityInput>;
@@ -86,15 +88,21 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env, waitUnti
     // This is what lets someone leave and come back later to the same
     // report/free-check allowance, on this browser, without an account.
     const { userId } = resolveUserId(request);
-    await lap('ensureUserMs', ensureUser(client, userId));
 
+    // The analysis does not need the database, so run it while the database connection is
+    // being opened instead of one after the other. Promise.all rejects on whichever fails
+    // first and still handles the other, so nothing is left unhandled.
+    //
     // The Workers AI binding is optional: without it (or if the model is slow, down or
     // out of free quota) the rules-based reader answers alone.
-    const fullResult = await lap('analyzeMs', analyzeOpportunity(safeInput, {
+    const analysis = lap('analyzeMs', analyzeOpportunity(safeInput, {
       llmApiKey: env.LLM_API_KEY,
       claimReader: undefined,
       onTimings: (t) => { timing.llmMs = t.llm; timing.probesMs = t.probes; timing.claimsMs = t.claims; },
     }));
+    const dbReady = lap('dbConnectMs', client.connect())
+      .then(() => lap('ensureUserMs', ensureUser(client, userId)));
+    const [fullResult] = await Promise.all([analysis, dbReady]);
 
     // 5 free screenings, lifetime, per persistent user id (not per IP —
     // see _lib/store.ts). This only decides how rich the preview is —
@@ -125,13 +133,13 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env, waitUnti
     return json(response, 200, { 'Set-Cookie': userIdSetCookieHeader(userId) });
   } catch (err) {
     console.error('analyze error', err);
-    return json({ error: 'Analysis failed' }, 500);
+    return json({ error: 'We could not complete the check right now. Please try again in a moment.' }, 500);
   } finally {
     console.log('[analyze timing]', JSON.stringify({ ...timing, totalMs: Date.now() - t0 }));
     // Close the connection in the background rather than making the
     // response wait for it — Hyperdrive's own pool is what actually
     // stays warm between requests, this is just this one request's
     // handle to it.
-    waitUntil(client.end());
+    waitUntil(client.end().catch(() => { /* never connected, or already closed */ }));
   }
 };

@@ -1,6 +1,7 @@
 import { Link, useLocation } from 'react-router-dom';
 import { ShieldCheck, Menu, X } from 'lucide-react';
 import { useState } from 'react';
+import ThemeToggle from '@/components/ThemeToggle';
 
 export default function Layout({ children }: { children: React.ReactNode }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -39,20 +40,25 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                 {link.label}
               </Link>
             ))}
+            <ThemeToggle />
             <Link
               to="/check"
-              className="ml-2 px-4 py-2 rounded-md text-sm font-semibold bg-gray-900 text-white hover:bg-gray-800 transition-colors"
+              className="ml-1 px-4 py-2 rounded-md text-sm font-semibold bg-gray-900 text-white hover:bg-gray-800 transition-colors"
             >
               Cap Check It
             </Link>
           </nav>
 
-          <button
-            onClick={() => setMenuOpen(!menuOpen)}
-            className="md:hidden p-2 rounded-md text-gray-600 hover:bg-gray-100"
-          >
-            {menuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
-          </button>
+          <div className="md:hidden flex items-center gap-1">
+            <ThemeToggle />
+            <button
+              onClick={() => setMenuOpen(!menuOpen)}
+              aria-label={menuOpen ? 'Close menu' : 'Open menu'}
+              className="p-2 rounded-md text-gray-600 hover:bg-gray-100"
+            >
+              {menuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
+            </button>
+          </div>
         </div>
 
         {menuOpen && (

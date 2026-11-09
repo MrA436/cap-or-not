@@ -1,3 +1,20 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+@layer base {
+  :root { color-scheme: light; }
+  .dark { color-scheme: dark; }
+
+  body {
+    @apply bg-gray-50 text-gray-900 antialiased;
+  }
+
+  /* Native form controls have no background class of their own, so without this
+     they stay white (with light text) in dark mode. */
+  input:not([type='checkbox']):not([type='radio']):not([type='file']),
+  textarea,
+  select {
+    @apply bg-white;
+  }
+}

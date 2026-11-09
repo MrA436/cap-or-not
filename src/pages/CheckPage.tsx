@@ -1,9 +1,14 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import OpportunityForm from '@/components/OpportunityForm';
+import AnalyzingOverlay from '@/components/AnalyzingOverlay';
 import type { OpportunityInput, AnalyzeResponse } from '@/types/analysis';
 import { saveCheck } from '@/services/storage';
 import { ShieldCheck } from 'lucide-react';
+
+// Longer than the server's own worst case (a few seconds of outside lookups plus
+// the database), so this only trips when something is genuinely stuck.
+const REQUEST_TIMEOUT_MS = 60_000;
 
 export default function CheckPage() {
   const navigate = useNavigate();
@@ -13,6 +18,9 @@ export default function CheckPage() {
   const handleSubmit = async (input: OpportunityInput) => {
     setIsAnalyzing(true);
     setError(null);
+
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
       // The full analysis is computed server-side but never sent here —
@@ -24,25 +32,41 @@ export default function CheckPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(input),
+        signal: controller.signal,
       });
 
       if (!res.ok) {
         const body = await res.json().catch(() => null);
-        throw new Error(body?.error ?? 'Analysis failed');
+        throw new Error(
+          body?.error ??
+            (res.status >= 500
+              ? 'Our server had a problem running your check. Please try again in a minute.'
+              : 'Analysis failed. Please try again.'),
+        );
       }
 
       const { publicResult, freeChecksRemaining }: AnalyzeResponse = await res.json();
       saveCheck(publicResult, input, freeChecksRemaining);
       navigate(`/result/${publicResult.id}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Something went wrong during analysis. Please try again.');
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setError('This is taking longer than expected. Please try again. What you pasted is still here.');
+      } else if (err instanceof TypeError) {
+        setError('Could not reach the server. Check your connection and try again.');
+      } else {
+        setError(err instanceof Error ? err.message : 'Something went wrong during analysis. Please try again.');
+      }
+      window.scrollTo({ top: 0, behavior: 'smooth' });
     } finally {
+      window.clearTimeout(timer);
       setIsAnalyzing(false);
     }
   };
 
   return (
     <div className="max-w-2xl mx-auto px-4 sm:px-6 py-8 sm:py-12">
+      {isAnalyzing && <AnalyzingOverlay />}
+
       <div className="text-center mb-8">
         <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-gray-100 mb-4">
           <ShieldCheck className="w-6 h-6 text-gray-600" />
@@ -54,7 +78,7 @@ export default function CheckPage() {
       </div>
 
       {error && (
-        <div className="mb-6 bg-red-50 border border-red-200 rounded-lg p-4 text-sm text-red-700">
+        <div role="alert" className="mb-6 bg-red-50 border border-red-200 rounded-lg p-4 text-sm text-red-700">
           {error}
         </div>
       )}

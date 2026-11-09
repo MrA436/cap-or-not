@@ -3,7 +3,7 @@ import { useParams, Link } from 'react-router-dom';
 import Report from '@/components/Report';
 import type { AnalysisResult, PublicAnalysisResult, OpportunityInput } from '@/types/analysis';
 import { getCheck, cacheFullResult } from '@/services/storage';
-import { ArrowLeft, FileX } from 'lucide-react';
+import { ArrowLeft, FileX, Loader2 } from 'lucide-react';
 
 interface LoadedReport {
   publicResult: PublicAnalysisResult;
@@ -76,7 +76,8 @@ export default function ResultPage() {
   if (loading) {
     return (
       <div className="max-w-2xl mx-auto px-4 py-16 text-center">
-        <p className="text-gray-500">Loading report...</p>
+        <Loader2 className="w-8 h-8 animate-spin text-gray-600 mx-auto mb-3" />
+        <p role="status" className="text-gray-600">Loading your report…</p>
       </div>
     );
   }
